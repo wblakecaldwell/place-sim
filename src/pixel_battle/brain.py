@@ -60,6 +60,10 @@ class AIFactionIdea(BaseModel):
     accent_color: str = "white"
 
 
+class AIFactionBatch(BaseModel):
+    factions: list[AIFactionIdea] = Field(description="List of distinct newly invented r/place factions")
+
+
 class TypographyDesign(BaseModel):
     include_text: bool = Field(
         description="True if this faction deliberately puts text/wordmark on its art; False (~35% of murals) for pure iconic art with no words"
@@ -320,6 +324,7 @@ class LocalVLMBrain:
         image: Image.Image | None = None,
         temperature: float = 0.80,
         max_tokens: int = 800,
+        response_format: dict | None = None,
     ) -> str | None:
         if image is not None:
             b64 = _pil_to_b64_png(image)
@@ -330,7 +335,7 @@ class LocalVLMBrain:
         else:
             user_content = user_text
 
-        payload = {
+        payload: dict = {
             "model": self.vlm_model,
             "messages": [
                 {"role": "system", "content": system},
@@ -339,8 +344,13 @@ class LocalVLMBrain:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         try:
             resp = self._client.post(f"{self.api_base}/chat/completions", json=payload)
+            if resp.status_code == 400 and response_format is not None:
+                payload.pop("response_format", None)
+                resp = self._client.post(f"{self.api_base}/chat/completions", json=payload)
             resp.raise_for_status()
             data = resp.json()
             return str(data["choices"][0]["message"]["content"])
@@ -355,17 +365,33 @@ class LocalVLMBrain:
         image: Image.Image | None,
         schema_cls: type[BaseModel],
         temperature: float = 0.80,
+        max_tokens: int = 700,
     ) -> BaseModel | None:
-        schema_hint = json.dumps(schema_cls.model_json_schema())
+        schema = schema_cls.model_json_schema()
+        schema_hint = json.dumps(schema)
         sys_full = (
             f"{system}\nRespond with ONLY a single valid JSON object matching this schema "
             f"(no extra text, no markdown):\n{schema_hint}"
         )
-        raw = self._chat_text(sys_full, user_text, image=image, temperature=temperature, max_tokens=550)
+        rf = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_cls.__name__,
+                "strict": False,
+                "schema": schema,
+            },
+        }
+        raw = self._chat_text(
+            sys_full,
+            user_text,
+            image=image,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=rf,
+        )
         if not raw:
             return None
         clean = self._strip_think_and_fences(raw)
-        # Extract outermost JSON object if extra prose leaked
         if not clean.startswith("{"):
             s = clean.find("{")
             e = clean.rfind("}")
@@ -793,37 +819,38 @@ class LocalVLMBrain:
             "- At least 1 stylized multilingual or community text logo (art_mode='banner', aspect='wide', fluid_cutout=true, short 2-10 char banner_text in quotes).\n"
             "- At least 1 visionless Geometric Chaos cult (art_mode='ai_code', fluid_cutout=true, pure abstract lines/lattices/spirals/beams/optical patterns — ZERO characters!).\n"
             "- For ALL characters, mascots, superheroes, cartoons, memes, and logos, set fluid_cutout=true so they float organically without square boxes!\n\n"
-            "Return ONLY a JSON array of objects with keys: "
+            "Return a JSON object `{\"factions\": [...]}` where every item has: "
             "name, timezone_region (AMERICAS|EUROPE|ASIA_PACIFIC|LATAM|GLOBAL), language, category, slogan, "
             "art_mode (flux_art|flux_comic|banner|ai_code), aspect (square|wide|tall), fluid_cutout (bool), "
             "banner_text, art_prompt (15-35 vivid visual words), primary_color, secondary_color, accent_color."
         )
 
-        raw = self._chat_text(system, user_text, image=None, temperature=0.92, max_tokens=2400)
-        if not raw:
-            return []
-        clean = self._strip_think_and_fences(raw)
-        if not clean.startswith("["):
-            s, e = clean.find("["), clean.rfind("]")
-            if s >= 0 and e > s:
-                clean = clean[s : e + 1]
-        try:
-            items = json.loads(clean)
-            if not isinstance(items, list):
-                return []
-        except Exception as exc:
-            log.warning("brainstorm_faction_batch JSON parse failed (%s)", exc)
-            return []
+        # Use LM Studio / Ollama structured JSON-schema output so JSON parsing never fails on multilingual quotes
+        res = self._chat_json(system, user_text, image=None, schema_cls=AIFactionBatch, temperature=0.88, max_tokens=2200)
+        raw_ideas: list[AIFactionIdea] = []
+        if isinstance(res, AIFactionBatch):
+            raw_ideas = list(res.factions)
+        else:
+            raw = self._chat_text(system, user_text, image=None, temperature=0.88, max_tokens=2200)
+            if raw:
+                clean = self._strip_think_and_fences(raw)
+                s, e = clean.find("["), clean.rfind("]")
+                if s >= 0 and e > s:
+                    try:
+                        parsed = json.loads(clean[s : e + 1])
+                        if isinstance(parsed, list):
+                            for obj in parsed:
+                                if isinstance(obj, dict):
+                                    try:
+                                        raw_ideas.append(AIFactionIdea.model_validate(obj))
+                                    except Exception:
+                                        pass
+                    except Exception as exc:
+                        log.warning("brainstorm_faction_batch fallback JSON parse failed (%s)", exc)
 
         seen_lower = {n.lower() for n in (existing_names or [])}
         ideas: list[AIFactionIdea] = []
-        for obj in items:
-            if not isinstance(obj, dict):
-                continue
-            try:
-                idea = AIFactionIdea.model_validate(obj)
-            except Exception:
-                continue
+        for idea in raw_ideas:
             nm = idea.name.strip()[:28]
             if not nm or nm.lower() in seen_lower:
                 continue

@@ -469,7 +469,7 @@ class SimulationEngine:
                     time.sleep(min_wo_dt - elapsed)
             elif self._brain_busy.is_set() and self.device.type == "mps":
                 # Give LM Studio MLX and FLUX clean Metal queue slices without stopping GPU pixel placements
-                time.sleep(0.22)
+                time.sleep(0.32)
             elif self.target_tps > 0:
                 min_dt = 1.0 / self.target_tps
                 elapsed = time.perf_counter() - step_start
