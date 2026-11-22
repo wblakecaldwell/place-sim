@@ -743,3 +743,32 @@ def test_neural_policy_2000x2000_1200_factions_mps_benchmark() -> None:
     print(f"[BENCH 2000x2000 1200 FACTIONS 120K SLOTS] {placed:,} px in {dt:.2f}s => {pps:,.0f} px/s on {dev}")
     if dev.type == "mps":
         assert pps >= 10_000, f"Expected >= 10,000 px/s on 2000x2000 MPS, got {pps:,.0f}"
+
+
+def test_macro_community_planner_profiles_and_export(tmp_path: Path) -> None:
+    """Verify fast ~1s macro community planner reproduces baseline sparsity vs tuned wall-to-wall coverage."""
+    from pixel_battle.planner import (
+        export_plan_artifacts,
+        preset_baseline_2000,
+        preset_tuned_1024,
+        preset_tuned_2000,
+        run_macro_plan,
+    )
+
+    t0 = time.perf_counter()
+    base = run_macro_plan(preset_baseline_2000(), steps=96)
+    tuned2k = run_macro_plan(preset_tuned_2000(), steps=96)
+    tuned1k = run_macro_plan(preset_tuned_1024(), steps=96)
+    dt = time.perf_counter() - t0
+    assert dt < 3.0, f"Macro planner should run in < 3s for 3 full 8h plans, took {dt:.2f}s"
+
+    sb = base.summary_dict()
+    s2 = tuned2k.summary_dict()
+    s1 = tuned1k.summary_dict()
+    assert sb["peak_cov_overall_pct"] < 45.0
+    assert s2["peak_cov_overall_pct"] >= 65.0 and s2["peak_cov_act3_pct"] >= 55.0
+    assert s1["peak_cov_overall_pct"] >= 70.0 and s1["peak_cov_act3_pct"] >= 60.0
+    assert s2["peak_organized_pct"] > sb["peak_organized_pct"] + 40.0
+
+    arts = export_plan_artifacts(tuned2k, tmp_path / "plan_out", render_mp4=True)
+    assert arts["trace"].exists() and arts["mp4"].exists() and arts["mp4"].stat().st_size > 8_000

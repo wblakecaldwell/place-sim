@@ -240,6 +240,49 @@ def _cmd_test_stack(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_plan(args: argparse.Namespace) -> int:
+    from pixel_battle.planner import (
+        export_plan_artifacts,
+        preset_baseline_2000,
+        preset_tuned_1024,
+        preset_tuned_2000,
+        run_macro_plan,
+    )
+
+    if args.profile == "baseline2000":
+        cfg = preset_baseline_2000()
+    elif args.profile == "tuned1024":
+        cfg = preset_tuned_1024()
+    else:
+        cfg = preset_tuned_2000()
+
+    if args.hours is not None:
+        cfg.hours = args.hours
+    if args.spawn_rate is not None:
+        cfg.factions_per_sim_min = args.spawn_rate
+    if args.size_mult is not None:
+        cfg.size_multiplier = args.size_mult
+    if args.burnout_cov is not None:
+        cfg.burnout_min_coverage = args.burnout_cov
+    cfg.seed = args.seed
+
+    t0 = time.perf_counter()
+    res = run_macro_plan(cfg, steps=144)
+    dt = time.perf_counter() - t0
+    out_dir = Path(args.out_dir)
+    arts = export_plan_artifacts(res, out_dir, render_mp4=not args.no_mp4)
+    s = res.summary_dict()
+    print(f"Macro plan '{args.profile}' simulated {cfg.hours:.1f}h ({cfg.width}x{cfg.height}) in {dt:.2f}s:")
+    print(
+        f"  Peak alive: {s['peak_alive_factions']} fac (founded {s['total_founded']}, burned out {s['total_burned_out']})\n"
+        f"  Peak coverage: {s['peak_cov_overall_pct']}% overall "
+        f"(Act 1 NW: {s['peak_cov_act1_pct']}%, Act 2 NE: {s['peak_cov_act2_pct']}%, Act 3 South: {s['peak_cov_act3_pct']}%)\n"
+        f"  Citizens: {s['peak_organized_pct']}% organized | {s['peak_free_agent_pct']}% free agents\n"
+        f"  Outputs: {', '.join(str(p) for p in arts.values())}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pixel-battle", description="Local AI/ML Reddit r/place simulation")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -318,6 +361,17 @@ def main(argv: list[str] | None = None) -> int:
     p_test.add_argument("--keychain-service", default="place-sim")
     p_test.add_argument("--no-flux-art", action="store_true")
     p_test.set_defaults(func=_cmd_test_stack)
+
+    p_plan = sub.add_parser("plan", help="Fast ~1s macro community simulation and storyboard MP4 preview")
+    p_plan.add_argument("--profile", choices=["baseline2000", "tuned1024", "tuned2000"], default="tuned2000")
+    p_plan.add_argument("--hours", type=float, default=None)
+    p_plan.add_argument("--spawn-rate", type=float, default=None, help="Factions spawned per wall-clock minute")
+    p_plan.add_argument("--size-mult", type=float, default=None, help="Artwork dimension scale multiplier")
+    p_plan.add_argument("--burnout-cov", type=float, default=None, help="Min coverage before burnout activates (0..1)")
+    p_plan.add_argument("--out-dir", default="runs/plan_preview")
+    p_plan.add_argument("--no-mp4", action="store_true")
+    p_plan.add_argument("--seed", type=int, default=2022)
+    p_plan.set_defaults(func=_cmd_plan)
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
