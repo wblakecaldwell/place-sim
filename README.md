@@ -5,7 +5,7 @@ A local AI/ML simulation of Reddit's **[r/place](https://www.reddit.com/r/place/
 No cloud APIs are used. Every citizen placement, artwork blueprint, wordmark, and diplomatic decision runs locally.
 
 <p align="center">
-  <img src="assets/demo.gif" alt="6-hour local AI r/place simulation timelapse" width="512" />
+  <img src="assets/timelapse.gif" alt="6-hour local AI r/place simulation timelapse" width="512" />
   <br />
   <em>6-hour local run compressed to 20 seconds: 88.2M pixel placements, 4.0M simulated users (~20% one-shot), and 200 concurrent factions on a 512x512 canvas.</em>
 </p>
