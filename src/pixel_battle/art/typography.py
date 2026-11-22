@@ -86,7 +86,41 @@ _FONT_CANDIDATES: dict[str, list[str]] = {
         "/System/Library/Fonts/Menlo.ttc",
         "/System/Library/Fonts/Monaco.ttf",
     ],
+    "cjk_bold": [
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ],
+    "korean_bold": [
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ],
+    "unicode_bold": [
+        "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+    ],
 }
+
+
+def _needs_cjk_font(text: str) -> str | None:
+    """Detect whether text contains CJK, Hangul, or non-ASCII characters requiring a Unicode font."""
+    has_hangul = any(0xAC00 <= ord(ch) <= 0xD7AF or 0x1100 <= ord(ch) <= 0x11FF for ch in text)
+    if has_hangul:
+        return "korean_bold"
+    has_cjk = any(
+        (0x4E00 <= ord(ch) <= 0x9FFF)
+        or (0x3040 <= ord(ch) <= 0x30FF)
+        or (0x3400 <= ord(ch) <= 0x4DBF)
+        for ch in text
+    )
+    if has_cjk:
+        return "cjk_bold"
+    if any(ord(ch) > 127 for ch in text):
+        return "unicode_bold"
+    return None
 
 FONT_STYLES = (
     "gothic",
@@ -206,8 +240,15 @@ def _render_ttf_word_mask(
     max_w: int,
 ) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """Render crisp 1-bit aliased TrueType glyphs + per-letter horizontal spans."""
-    font_path = _get_font_path(font_style)
-    if font_path is None or font_style == "pixel_retro":
+    uni_override = _needs_cjk_font(text)
+    if uni_override is not None:
+        font_path = _get_font_path(uni_override)
+        # CJK glyphs need at least 11px to stay legible as 1-bit pixel art
+        target_px_h = max(target_px_h, 12 if uni_override in ("cjk_bold", "korean_bold") else 10)
+    else:
+        font_path = _get_font_path(font_style)
+
+    if font_path is None or (font_style == "pixel_retro" and uni_override is None):
         if target_px_h <= 8:
             return _render_bitmap_word_mask(text, _FONT_3X5, scale=1)
         sc = 2 if target_px_h >= 14 and len(text) * 12 <= max_w else 1

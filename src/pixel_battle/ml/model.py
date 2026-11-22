@@ -178,6 +178,7 @@ class RedditCitizenNet(nn.Module):
         temp_pos: float = 1.0,
         temp_col: float = 0.9,
         valid_pos_mask: torch.Tensor | None = None,
+        allowed_color_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample (dy, dx, color) from the learned joint distribution in one batched GPU pass."""
         P = self.patch_size
@@ -205,7 +206,10 @@ class RedditCitizenNet(nn.Module):
         else:
             color_logits = self.predict_color_at(feat, raw, pos_idx)
 
-        probs_c = F.softmax(color_logits.float() / max(0.05, temp_col), dim=-1)
+        logits_c = color_logits.float() / max(0.05, temp_col)
+        if allowed_color_mask is not None:
+            logits_c = logits_c.masked_fill(~allowed_color_mask.unsqueeze(0), -1e9)
+        probs_c = F.softmax(logits_c, dim=-1)
         color = torch.multinomial(probs_c, num_samples=1).squeeze(-1).to(torch.uint8)
 
         dy = (pos_idx // P).to(torch.int32) - R

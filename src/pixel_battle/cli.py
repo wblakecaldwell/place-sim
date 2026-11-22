@@ -1,4 +1,4 @@
-"""CLI entrypoints for running the pixel battle, testing local models, and rendering timelapses."""
+"""CLI entrypoints for running the pixel battle, testing local AI models, and rendering timelapses."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import uvicorn
 
-from pixel_battle.config import SimConfig
+from pixel_battle.config import SimConfig, apply_preset
 from pixel_battle.engine import SimulationEngine, resolve_device
 from pixel_battle.server import create_app
 from pixel_battle.timelapse import render_timelapse
@@ -28,32 +28,51 @@ def _setup_logging(verbose: bool = False) -> None:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir) if args.run_dir else Path("runs") / datetime.now().strftime("battle_%Y%m%d_%H%M%S")
-    cfg = SimConfig(
-        width=args.width,
-        height=args.height,
-        num_users=args.users,
-        max_ticks=args.max_ticks,
-        max_hours=args.max_hours,
-        chaos_ticks=args.chaos_ticks,
-        discovery_interval=args.discovery_interval,
-        epoch_interval=args.epoch_interval,
-        max_active_factions=args.max_factions,
-        target_tps=args.tps,
-        ollama_url=args.ollama_url,
-        vlm_model=args.vlm_model,
-        use_diffusion=not args.no_diffusion,
-        use_flux_typography=not args.no_flux_typography,
-        policy_mode=args.policy,
-        neural_model_path=Path(args.neural_model),
-        device=args.device,
-        run_dir=run_dir,
-        seed=args.seed,
-        host=args.host,
-        port=args.port,
-    )
+    cfg = SimConfig(run_dir=run_dir)
+    apply_preset(cfg, args.preset)
+
+    # Apply explicit CLI overrides on top of preset defaults
+    if args.width is not None:
+        cfg.width = args.width
+    if args.height is not None:
+        cfg.height = args.height
+    if args.users is not None:
+        cfg.num_users = args.users
+    if args.max_factions is not None:
+        cfg.max_active_factions = args.max_factions
+    if args.chaos_ticks is not None:
+        cfg.chaos_ticks = args.chaos_ticks
+    if args.discovery_interval is not None:
+        cfg.discovery_interval = args.discovery_interval
+    if args.epoch_interval is not None:
+        cfg.epoch_interval = args.epoch_interval
+    if args.flash_raid_interval is not None:
+        cfg.flash_raid_interval_ticks = args.flash_raid_interval
+
+    cfg.max_ticks = args.max_ticks
+    cfg.max_hours = args.max_hours
+    cfg.target_tps = args.tps
+    cfg.llm_url = args.llm_url or args.ollama_url or cfg.llm_url
+    cfg.llm_model = args.llm_model or args.vlm_model or cfg.llm_model
+    cfg.ollama_url = cfg.llm_url
+    cfg.vlm_model = cfg.llm_model
+    cfg.keychain_service = args.keychain_service
+    cfg.use_flux_art = not args.no_flux_art
+    cfg.use_flux_typography = not args.no_flux_typography
+    cfg.use_diffusion = args.use_diffusion
+    cfg.enable_expansion = not args.no_expansion
+    cfg.enable_whiteout = not args.no_whiteout
+    cfg.enable_timezones = not args.no_timezones
+    cfg.enable_flash_raids = not args.no_flash_raids
+    cfg.enable_burnout = not args.no_burnout
+    cfg.policy_mode = args.policy
+    cfg.neural_model_path = Path(args.neural_model)
+    cfg.device = args.device
+    cfg.seed = args.seed
+    cfg.host = args.host
+    cfg.port = args.port
 
     engine = SimulationEngine(cfg, resume=args.resume)
-    # Keep a convenient symlink runs/latest -> current run
     latest_link = Path("runs/latest")
     if run_dir.parent == Path("runs") and run_dir.name != "latest":
         try:
@@ -63,15 +82,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
         except OSError:
             pass
 
-    if cfg.use_diffusion and args.warmup_diffusion:
-        print("Warming up local SDXL-Turbo + nerijs/pixel-art-xl on MPS...")
+    if (cfg.use_flux_art or cfg.use_diffusion) and (args.warmup_flux or args.warmup_diffusion):
+        print("Warming up local MLX FLUX.1-schnell + Pixel-Art LoRA...")
         engine.art.warmup()
 
     engine.start()
-    print(f"\nPixel Battle running in: {run_dir}")
-    print(f"Canvas: {cfg.width}x{cfg.height} | Citizens: {cfg.num_users:,} | Device: {engine.device} | Policy: {engine.policy_name}")
-    print(f"Ollama ({cfg.vlm_model}): {'ONLINE' if engine.ollama_ready else 'OFFLINE (using fallback)'}")
-    print(f"Art engine: {'Hybrid (SDXL-Turbo pixel-art img2img + Procedural)' if cfg.use_diffusion else 'Procedural only'}")
+    print(f"\nPixel Battle ({cfg.preset}) running in: {run_dir}")
+    print(
+        f"Canvas: {engine.canvas.active_w}x{engine.canvas.active_h} -> {cfg.width}x{cfg.height} "
+        f"(palette={len(engine.canvas.allowed_colors)}c, 4-act={'ON' if cfg.enable_expansion else 'OFF'}) | "
+        f"Online Slots: {cfg.num_users:,} | Max Factions: {cfg.max_active_factions:,}"
+    )
+    print(f"Device: {engine.device} | Policy: {engine.policy_name}")
+    print(f"Local VLM ({cfg.llm_model} @ {cfg.llm_url}): {'ONLINE' if engine.ollama_ready else 'OFFLINE (fallback)'}")
+    print(f"Art engine: {'MLX FLUX.1-schnell Pixel-Art LoRA + LLM Code + Unicode Typography' if cfg.use_flux_art else 'Procedural / Offline'}")
 
     if args.headless:
         def _handle_sig(_signum, _frame):
@@ -88,14 +112,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 pop = st.get("population", {})
                 u_tot = pop.get("total_unique_users", cfg.num_users)
                 os_pct = pop.get("one_shot_pct", 20.0)
-                tc = st.get("tier_counts", {})
-                tier_str = f"M:{tc.get('macro',0)}/m:{tc.get('medium',0)}/u:{tc.get('micro',0)}/R:{tc.get('ribbon',0)}"
+                n_fac = st.get("total_active_factions", len(st["factions"]))
+                ai_pct = st.get("ai_faction_pct", 0.0)
                 print(
-                    f"[{elapsed_m:5.1f}m | t={st['tick']:6d} / {lim}] "
-                    f"{st['total_placements']:10,d} px | "
+                    f"[{elapsed_m:5.1f}m | Act {st['act']} Hr {st['virtual_hour']:4.1f}/72 | "
+                    f"{st['active_w']}x{st['active_h']} {st['palette_size']:2d}c | t={st['tick']:6d}/{lim}] "
+                    f"{st['total_placements']:11,d} px | "
                     f"{st['pixels_per_sec']:6,d} px/s | "
                     f"users={u_tot:,} ({os_pct:.1f}% 1-shot) | "
-                    f"{len(st['factions']):3d} fac ({tier_str}) | "
+                    f"{n_fac:4d} fac ({ai_pct:.0f}% AI) | "
                     f"{st['brain_status']}",
                     flush=True,
                 )
@@ -119,7 +144,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_render(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir)
     out_path = Path(args.out) if args.out else run_dir / "timelapse.mp4"
-    print(f"Rendering timelapse from {run_dir} -> {out_path} ({args.fps} fps, {args.duration}s, scale={args.scale}x)...")
+    print(
+        f"Rendering timelapse from {run_dir} -> {out_path} "
+        f"({args.fps} fps, {args.duration}s, scale={args.scale}x, dynamic_camera={not args.no_dynamic_camera})..."
+    )
     t0 = time.perf_counter()
     res = render_timelapse(
         run_dir=run_dir,
@@ -131,6 +159,7 @@ def _cmd_render(args: argparse.Namespace) -> int:
         show_hud=not args.no_hud,
         crf=args.crf,
         curve=args.curve,
+        dynamic_camera=not args.no_dynamic_camera,
     )
     dt = time.perf_counter() - t0
     print(f"Done in {dt:.1f}s -> {res}")
@@ -163,7 +192,7 @@ def _cmd_test_stack(args: argparse.Namespace) -> int:
     from PIL import Image
     from pixel_battle.art.manager import ArtManager
     from pixel_battle.brain import LocalVLMBrain
-    from pixel_battle.palette import PALETTE_RGB
+    from pixel_battle.palette import PALETTE_RGB, PALETTE_TIER_1_16
 
     dev = resolve_device("auto")
     print(f"1. PyTorch device: {dev}")
@@ -171,84 +200,80 @@ def _cmd_test_stack(args: argparse.Namespace) -> int:
     out_dir = Path("runs/stack_test")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Test Ollama qwen2.5vl:7b vision structured output
-    brain = LocalVLMBrain(vlm_model=args.vlm_model)
+    llm_url = args.llm_url
+    llm_model = args.llm_model
+    brain = LocalVLMBrain(ollama_url=llm_url, vlm_model=llm_model, keychain_service=args.keychain_service)
     healthy = brain.check_health()
-    print(f"2. Ollama ({args.vlm_model}) health: {'OK' if healthy else 'NOT FOUND'}")
+    print(f"2. Local VLM ({llm_model} @ {llm_url}) health: {'OK' if healthy else 'NOT FOUND'}")
     if healthy:
-        # Feed a synthetic messy green/yellow blob for pareidolia test
-        arr = np.full((56, 56, 3), 255, dtype=np.uint8)
-        arr[16:40, 14:42] = PALETTE_RGB[9]   # green
-        arr[12:20, 22:34] = PALETTE_RGB[6]   # yellow crown-ish blob
-        arr[22:26, 20:24] = PALETTE_RGB[1]   # eyes
-        arr[22:26, 32:36] = PALETTE_RGB[1]
-        blob_img = Image.fromarray(arr).resize((336, 336), Image.Resampling.NEAREST)
         t0 = time.perf_counter()
-        prop, theme = brain.pareidolia_discover(blob_img, ["green", "yellow", "black"], [], [])
-        print(f"   Pareidolia ({time.perf_counter()-t0:.2f}s): {prop.name} [{prop.art_mode} | {prop.banner_text}] ({theme}) -> \"{prop.art_prompt}\"")
-    brain.close()
+        ideas = brain.brainstorm_faction_batch(count=4, act=1, virtual_hour=6.0, unlocked_colors=PALETTE_TIER_1_16)
+        print(f"   Brainstormed {len(ideas)} factions in {time.perf_counter()-t0:.2f}s:")
+        for idea in ideas:
+            print(f"     - {idea.name} [{idea.timezone_region}/{idea.language}, {idea.art_mode}, fluid={idea.fluid_cutout}]")
 
-    # Test Hybrid Art (procedural + optional diffusion txt2img & img2img)
-    cfg = SimConfig(use_diffusion=not args.no_diffusion)
+        code = brain.write_geometric_code("Spiral Lattice", "concentric spiral diamonds", 48, 48, PALETTE_TIER_1_16)
+        print(f"   Geometric code generated ({len(code)} chars)")
+
+    cfg = SimConfig(use_flux_art=not args.no_flux_art, use_diffusion=False)
     art = ArtManager(cfg, dev)
-    t0 = time.perf_counter()
-    proc_bp, _ = art.create_blueprint("procedural", "regal emerald castle shield", 64, 64, 9, 6, 0, "TEST")
-    proc_img = Image.fromarray(PALETTE_RGB[np.where(proc_bp < 0, 0, proc_bp)]).resize((256, 256), Image.Resampling.NEAREST)
-    proc_img.save(out_dir / "procedural_sample.png")
-    print(f"3. Procedural art ({time.perf_counter()-t0:.3f}s) saved -> {out_dir / 'procedural_sample.png'}")
-
-    if not args.no_diffusion:
-        print("4. Loading SDXL-Turbo + nerijs/pixel-art-xl (first run downloads weights from Hugging Face)...")
+    if not args.no_flux_art:
+        print("3. Testing MLX FLUX.1-schnell + Pixel-Art LoRA (fluid die-cut silhouette)...")
         t0 = time.perf_counter()
-        diff_bp, _ = art.create_blueprint("diffusion", "cute green pixel frog wearing golden crown", 64, 64, 9, 6, 0, "FROG")
-        diff_rgb = PALETTE_RGB[np.where(diff_bp < 0, 0, diff_bp)]
-        Image.fromarray(diff_rgb).resize((256, 256), Image.Resampling.NEAREST).save(out_dir / "diffusion_txt2img.png")
-        print(f"   txt2img ({time.perf_counter()-t0:.2f}s) saved -> {out_dir / 'diffusion_txt2img.png'}")
-
-        # Punch a Void scar on the right half and test img2img morphing
-        scarred = diff_rgb.copy()
-        scarred[10:50, 42:62] = PALETTE_RGB[1]
-        t0 = time.perf_counter()
-        morph_bp = art.morph_blueprint(
-            "diffusion",
-            "royal pixel frog king with glowing dark shadow portal on right side",
-            scarred,
+        bp, eng = art.create_blueprint(
+            "flux_art",
+            "cheerful tuxedo cat wearing a tiny golden wizard hat, crisp 16-bit pixel art sprite",
             64,
             64,
-            9,
+            15,
             6,
-            21,
-            stage=2,
-            strength=0.82,
+            0,
+            "CatWizard",
+            allowed_colors=PALETTE_TIER_1_16,
+            fluid_cutout=True,
         )
-        morph_rgb = PALETTE_RGB[np.where(morph_bp < 0, 0, morph_bp)]
-        Image.fromarray(morph_rgb).resize((256, 256), Image.Resampling.NEAREST).save(out_dir / "diffusion_morph.png")
-        print(f"   img2img morph ({time.perf_counter()-t0:.2f}s) saved -> {out_dir / 'diffusion_morph.png'}")
+        rgb = PALETTE_RGB[np.where(bp < 0, 0, bp)]
+        Image.fromarray(rgb).resize((256, 256), Image.Resampling.NEAREST).save(out_dir / "flux_pixel_sample.png")
+        print(f"   FLUX pixel art ({eng}, {time.perf_counter()-t0:.2f}s) saved -> {out_dir / 'flux_pixel_sample.png'}")
 
+    brain.close()
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="pixel-battle", description="Local AI/ML r/place simulation")
+    parser = argparse.ArgumentParser(prog="pixel-battle", description="Local AI/ML Reddit r/place simulation")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="Start the live pixel battle simulation")
-    p_run.add_argument("--width", type=int, default=512)
-    p_run.add_argument("--height", type=int, default=512)
-    p_run.add_argument("--users", type=int, default=36_000)
+    p_run.add_argument("--preset", choices=["standard", "large", "reddit2022"], default="standard", help="Scale preset")
+    p_run.add_argument("--width", type=int, default=None)
+    p_run.add_argument("--height", type=int, default=None)
+    p_run.add_argument("--users", type=int, default=None)
     p_run.add_argument("--max-ticks", type=int, default=8_000)
     p_run.add_argument("--max-hours", type=float, default=0.0, help="If > 0, run for this many wall-clock hours cleanly")
-    p_run.add_argument("--chaos-ticks", type=int, default=140)
-    p_run.add_argument("--discovery-interval", type=int, default=45)
-    p_run.add_argument("--epoch-interval", type=int, default=110)
-    p_run.add_argument("--max-factions", type=int, default=200)
+    p_run.add_argument("--chaos-ticks", type=int, default=None)
+    p_run.add_argument("--discovery-interval", type=int, default=None)
+    p_run.add_argument("--epoch-interval", type=int, default=None)
+    p_run.add_argument("--flash-raid-interval", type=int, default=None)
+    p_run.add_argument("--max-factions", type=int, default=None)
     p_run.add_argument("--tps", type=float, default=18.0, help="Target ticks/sec (0 = uncapped)")
-    p_run.add_argument("--ollama-url", default="http://localhost:11434")
-    p_run.add_argument("--vlm-model", default="qwen2.5vl:7b")
-    p_run.add_argument("--no-diffusion", action="store_true", help="Disable SDXL-Turbo diffusion (procedural only)")
-    p_run.add_argument("--no-flux-typography", action="store_true", help="Disable 4-bit FLUX.1-schnell MLX wordmarks")
-    p_run.add_argument("--warmup-diffusion", action="store_true", help="Load diffusion model before starting ticks")
+    p_run.add_argument("--llm-url", default=None, help="OpenAI-compatible local LLM endpoint (e.g. http://localhost:1234/v1)")
+    p_run.add_argument("--llm-model", default=None, help="Local VLM model name (e.g. qwen3-vl-30b-a3b-instruct-mlx)")
+    p_run.add_argument("--keychain-service", default="place-sim", help="macOS Keychain service name for local API token")
+    p_run.add_argument("--ollama-url", default=None, help="Legacy alias for --llm-url")
+    p_run.add_argument("--vlm-model", default=None, help="Legacy alias for --llm-model")
+    p_run.add_argument("--no-flux-art", action="store_true", help="Disable MLX FLUX.1-schnell Pixel-Art LoRA")
+    p_run.add_argument("--no-flux-typography", action="store_true", help="Disable FLUX wordmark mode")
+    p_run.add_argument("--use-diffusion", action="store_true", help="Enable legacy SDXL-Turbo fallback")
+    p_run.add_argument("--no-diffusion", action="store_true", help="Legacy flag (SDXL-Turbo is off by default)")
+    p_run.add_argument("--warmup-flux", action="store_true", help="Preload MLX FLUX Pixel-Art LoRA before starting ticks")
+    p_run.add_argument("--warmup-diffusion", action="store_true", help="Legacy alias for --warmup-flux")
+    p_run.add_argument("--no-expansion", action="store_true", help="Disable 4-act canvas expansion and start at full size")
+    p_run.add_argument("--no-whiteout", action="store_true", help="Disable Act 4 Whiteout finale")
+    p_run.add_argument("--no-timezones", action="store_true", help="Disable regional timezone diurnal sleep waves")
+    p_run.add_argument("--no-flash-raids", action="store_true", help="Disable regional streamer flash-raids")
+    p_run.add_argument("--no-burnout", action="store_true", help="Disable community burnout turnover")
     p_run.add_argument("--policy", choices=["auto", "neural", "stochastic"], default="auto", help="Pixel painting policy")
     p_run.add_argument("--neural-model", default="models/reddit_citizen.pt", help="Path to trained RedditCitizenNet weights")
     p_run.add_argument("--device", default="auto")
@@ -265,9 +290,10 @@ def main(argv: list[str] | None = None) -> int:
     p_ren.add_argument("--out", default=None, help="Output MP4 file path")
     p_ren.add_argument("--fps", type=int, default=60)
     p_ren.add_argument("--duration", type=float, default=60.0, help="Video duration in seconds (excluding end hold)")
-    p_ren.add_argument("--scale", type=int, default=2, help="Nearest-neighbor upscale factor (2 => 1024x1024)")
+    p_ren.add_argument("--scale", type=int, default=1, help="Nearest-neighbor upscale factor (1 on 2000x2000 = native 2K)")
     p_ren.add_argument("--hold", type=float, default=3.0, help="Final freeze-frame hold seconds")
     p_ren.add_argument("--no-hud", action="store_true", help="Disable bottom chronicle HUD bar")
+    p_ren.add_argument("--no-dynamic-camera", action="store_true", help="Disable 4-act dynamic camera pull-back")
     p_ren.add_argument("--crf", type=int, default=18)
     p_ren.add_argument("--curve", type=float, default=1.35, help="Pacing exponent (>1.0 slows early chaos, 1.0=linear)")
     p_ren.set_defaults(func=_cmd_render)
@@ -286,9 +312,11 @@ def main(argv: list[str] | None = None) -> int:
     p_train.add_argument("--seed", type=int, default=42)
     p_train.set_defaults(func=_cmd_train_reddit)
 
-    p_test = sub.add_parser("test-stack", help="Verify MPS GPU, Ollama Qwen2.5-VL, procedural art, and pixel-art diffusion")
-    p_test.add_argument("--vlm-model", default="qwen2.5vl:7b")
-    p_test.add_argument("--no-diffusion", action="store_true")
+    p_test = sub.add_parser("test-stack", help="Verify MPS GPU, local Qwen3-VL LM Studio API, and MLX FLUX Pixel-Art LoRA")
+    p_test.add_argument("--llm-url", default="http://localhost:1234/v1")
+    p_test.add_argument("--llm-model", default="qwen3-vl-30b-a3b-instruct-mlx")
+    p_test.add_argument("--keychain-service", default="place-sim")
+    p_test.add_argument("--no-flux-art", action="store_true")
     p_test.set_defaults(func=_cmd_test_stack)
 
     args = parser.parse_args(argv)

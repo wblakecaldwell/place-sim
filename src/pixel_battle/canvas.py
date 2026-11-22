@@ -8,16 +8,24 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from pixel_battle.palette import PALETTE_RGB, WHITE_IDX
+from pixel_battle.palette import NUM_COLORS, PALETTE_RGB, WHITE_IDX, get_tier_colors
 
 if TYPE_CHECKING:
     from pixel_battle.factions import Faction
 
 
 class CanvasState:
-    """Maintains the live pixel grid, ownership, recency, and activity heatmap on MPS/CPU."""
+    """Maintains the live pixel grid, active viewport, unlocked palette, ownership, recency, and activity on MPS/CPU."""
 
-    def __init__(self, width: int, height: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        device: torch.device,
+        active_w: int | None = None,
+        active_h: int | None = None,
+        palette_tier: int = 3,
+    ) -> None:
         self.width = width
         self.height = height
         self.device = device
@@ -27,6 +35,28 @@ class CanvasState:
         self.owner = torch.full((height, width), -1, dtype=torch.int16, device=device)
         self.last_edit_tick = torch.full((height, width), -10_000, dtype=torch.int32, device=device)
         self.activity = torch.zeros((height, width), dtype=torch.float32, device=device)
+
+        self.active_w: int = min(width, max(64, active_w if active_w is not None else width))
+        self.active_h: int = min(height, max(64, active_h if active_h is not None else height))
+        self.palette_tier: int = 3
+        self.allowed_colors: tuple[int, ...] = get_tier_colors(3)
+        self.allowed_color_mask: torch.Tensor = torch.ones(NUM_COLORS, dtype=torch.bool, device=device)
+        self.expand_viewport(self.active_w, self.active_h, palette_tier)
+
+    def expand_viewport(self, new_w: int, new_h: int, new_palette_tier: int) -> None:
+        """Update the unlocked active viewport dimensions and unlocked palette tier."""
+        self.active_w = max(64, min(self.width, int(new_w)))
+        self.active_h = max(64, min(self.height, int(new_h)))
+        self.palette_tier = max(1, min(4, int(new_palette_tier)))
+        self.allowed_colors = get_tier_colors(self.palette_tier)
+        mask = torch.zeros(NUM_COLORS, dtype=torch.bool, device=self.device)
+        idx = torch.tensor(self.allowed_colors, dtype=torch.long, device=self.device)
+        mask[idx] = True
+        self.allowed_color_mask = mask
+
+    @property
+    def is_whiteout(self) -> bool:
+        return self.palette_tier >= 4
 
     def decay_activity(self, factor: float = 0.94) -> None:
         self.activity.mul_(factor)
@@ -39,24 +69,29 @@ class CanvasState:
         new_colors: torch.Tensor,
         factions: torch.Tensor,
     ) -> None:
-        """Apply a batch of pixel placements in-place on GPU."""
+        """Apply a batch of pixel placements in-place on GPU, bounded to the active viewport & palette."""
         if xs.numel() == 0:
             return
-        new_u8 = new_colors.to(torch.uint8)
-        prev = self.colors[ys, xs]
+        xs_c = xs.clamp(0, self.active_w - 1)
+        ys_c = ys.clamp(0, self.active_h - 1)
+        if self.palette_tier >= 4:
+            new_u8 = torch.full_like(new_colors, WHITE_IDX, dtype=torch.uint8)
+        else:
+            new_u8 = new_colors.to(torch.uint8)
+        prev = self.colors[ys_c, xs_c]
         changed_bool = prev != new_u8
         changed = changed_bool.to(torch.float32)
 
         # Store prior color only when a pixel changes to preserve pre-griefing state
         if changed_bool.any():
-            self.prev_colors[ys[changed_bool], xs[changed_bool]] = prev[changed_bool]
+            self.prev_colors[ys_c[changed_bool], xs_c[changed_bool]] = prev[changed_bool]
 
-        self.colors[ys, xs] = new_u8
-        self.owner[ys, xs] = factions.to(torch.int16)
-        self.last_edit_tick[ys, xs] = int(tick)
+        self.colors[ys_c, xs_c] = new_u8
+        self.owner[ys_c, xs_c] = factions.to(torch.int16)
+        self.last_edit_tick[ys_c, xs_c] = int(tick)
         # Boost activity where pixels actually flipped (and small bump for reinforcement)
-        self.activity[ys, xs] = torch.clamp(
-            self.activity[ys, xs] + 0.25 + 1.0 * changed, max=12.0
+        self.activity[ys_c, xs_c] = torch.clamp(
+            self.activity[ys_c, xs_c] + 0.25 + 1.0 * changed, max=12.0
         )
 
     def colors_numpy(self) -> np.ndarray:
@@ -71,21 +106,24 @@ class CanvasState:
     def activity_numpy(self) -> np.ndarray:
         return self.activity.detach().cpu().numpy()
 
-    def to_rgb_numpy(self) -> np.ndarray:
+    def to_rgb_numpy(self, active_only: bool = False) -> np.ndarray:
         idx = self.colors_numpy()
+        if active_only:
+            idx = idx[: self.active_h, : self.active_w]
         return PALETTE_RGB[idx]
 
-    def to_pil(self, scale: int = 1) -> Image.Image:
-        img = Image.fromarray(self.to_rgb_numpy(), mode="RGB")
+    def to_pil(self, scale: int = 1, active_only: bool = False) -> Image.Image:
+        rgb = self.to_rgb_numpy(active_only=active_only)
+        img = Image.fromarray(rgb, mode="RGB")
         if scale != 1:
-            img = img.resize((self.width * scale, self.height * scale), Image.Resampling.NEAREST)
+            img = img.resize((img.width * scale, img.height * scale), Image.Resampling.NEAREST)
         return img
 
     def crop_rgb_numpy(self, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
-        x0 = max(0, min(self.width - 1, x0))
-        y0 = max(0, min(self.height - 1, y0))
-        x1 = max(x0 + 1, min(self.width, x1))
-        y1 = max(y0 + 1, min(self.height, y1))
+        x0 = max(0, min(self.active_w - 1, x0))
+        y0 = max(0, min(self.active_h - 1, y0))
+        x1 = max(x0 + 1, min(self.active_w, x1))
+        y1 = max(y0 + 1, min(self.active_h, y1))
         idx = self.colors[y0:y1, x0:x1].detach().cpu().numpy()
         return PALETTE_RGB[idx]
 
@@ -106,8 +144,8 @@ class CanvasState:
         """Render a crisp upscaled crop around a faction with subtle neighbor bounding boxes."""
         vx0 = max(0, faction.x0 - margin)
         vy0 = max(0, faction.y0 - margin)
-        vx1 = min(self.width, faction.x1 + margin)
-        vy1 = min(self.height, faction.y1 + margin)
+        vx1 = min(self.active_w, faction.x1 + margin)
+        vy1 = min(self.active_h, faction.y1 + margin)
 
         rgb = self.crop_rgb_numpy(vx0, vy0, vx1, vy1)
         vw, vh = vx1 - vx0, vy1 - vy0

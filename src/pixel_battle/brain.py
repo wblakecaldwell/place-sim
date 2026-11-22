@@ -1,11 +1,15 @@
-"""Local Ollama Qwen2.5-VL multimodal brain for pareidolia discovery, color diversity & diplomacy."""
+"""Local OpenAI-compatible Vision-Language brain (LM Studio MLX / Ollama) for AI-first faction creation, coding & diplomacy."""
 
 from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
+import os
 import random
+import re
+import subprocess
 from typing import Literal
 
 import httpx
@@ -17,6 +21,43 @@ from pixel_battle.factions import DiplomacyMessage, Faction
 from pixel_battle.palette import BLACK_IDX, COLOR_NAMES, WHITE_IDX, resolve_color
 
 log = logging.getLogger(__name__)
+
+
+def load_local_api_token(keychain_service: str = "place-sim") -> str:
+    """Load local LM Studio API token from LMSTUDIO_API_KEY or macOS Keychain (never stored in files)."""
+    env_tok = os.environ.get("LMSTUDIO_API_KEY", "").strip()
+    if env_tok:
+        return env_tok
+    if not keychain_service:
+        return ""
+    try:
+        user = os.environ.get("USER", "")
+        if not user:
+            return ""
+        return subprocess.check_output(
+            ["security", "find-generic-password", "-a", user, "-s", keychain_service, "-w"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3.0,
+        ).strip()
+    except Exception:
+        return ""
+
+
+class AIFactionIdea(BaseModel):
+    name: str = Field(description="Short distinct faction name (2-24 chars)")
+    timezone_region: Literal["AMERICAS", "EUROPE", "ASIA_PACIFIC", "LATAM", "GLOBAL"] = "GLOBAL"
+    language: str = Field(default="en", description="ISO language code: en, zh, es, fr, de, ja, ko, pt, tr")
+    category: str = Field(default="art", description="e.g. comic, cartoon, movie, superhero, meme, international, logo, geometric, game, anime")
+    slogan: str = Field(default="", description="Short rallying slogan in the faction's language")
+    art_mode: Literal["flux_art", "flux_comic", "banner", "ai_code"] = "flux_art"
+    aspect: Literal["square", "wide", "tall"] = "square"
+    fluid_cutout: bool = Field(default=True, description="True for die-cut floating shapes/mascots/logos; False only for framed 3-panel comics")
+    banner_text: str = Field(default="", description="Short 2-12 char wordmark text if banner or labeled emblem")
+    art_prompt: str = Field(description="Concrete 15-35 word pixel-art visual description")
+    primary_color: str = "blue"
+    secondary_color: str = "yellow"
+    accent_color: str = "white"
 
 
 class TypographyDesign(BaseModel):
@@ -220,28 +261,92 @@ _BANNED_CLICHES = ("radiant", "whirl", "twirl", "luminous", "mystic", "cosmic", 
 
 
 class LocalVLMBrain:
-    """Interfaces with local Ollama qwen2.5vl:7b using strict JSON schemas & vibrant palette rotation."""
+    """Interfaces with local LM Studio (MLX) or Ollama via OpenAI-compatible /v1/chat/completions."""
 
     def __init__(
         self,
-        ollama_url: str = "http://localhost:11434",
-        vlm_model: str = "qwen2.5vl:7b",
-        timeout: float = 45.0,
+        ollama_url: str = "http://localhost:1234/v1",
+        vlm_model: str = "qwen3-vl-30b-a3b-instruct-mlx",
+        timeout: float = 150.0,
+        keychain_service: str = "place-sim",
     ) -> None:
-        self.ollama_url = ollama_url.rstrip("/")
+        base = ollama_url.rstrip("/")
+        # Normalize base URL to OpenAI-compatible /v1 endpoint (works on LM Studio and Ollama)
+        if not base.endswith("/v1"):
+            self.api_base = f"{base}/v1"
+        else:
+            self.api_base = base
+        self.ollama_url = base
         self.vlm_model = vlm_model
         self.timeout = timeout
-        self._client = httpx.Client(timeout=timeout)
+        self._api_token = load_local_api_token(keychain_service)
+        headers = {"Authorization": f"Bearer {self._api_token}"} if self._api_token else {}
+        self._client = httpx.Client(timeout=timeout, headers=headers)
         self._fallback_idx = 0
 
     def check_health(self) -> bool:
         try:
-            r = self._client.get(f"{self.ollama_url}/api/tags", timeout=5.0)
+            r = self._client.get(f"{self.api_base}/models", timeout=5.0)
+            r.raise_for_status()
+            data = r.json()
+            ids = [str(m.get("id", "")) for m in data.get("data", [])]
+            if any(self.vlm_model in mid or mid in self.vlm_model for mid in ids):
+                return True
+            return len(ids) > 0
+        except Exception:
+            pass
+        # Legacy Ollama /api/tags fallback
+        try:
+            root = self.api_base[:-3] if self.api_base.endswith("/v1") else self.api_base
+            r = self._client.get(f"{root}/api/tags", timeout=5.0)
             r.raise_for_status()
             names = [m.get("name", "") for m in r.json().get("models", [])]
-            return any(self.vlm_model in n for n in names)
+            return any(self.vlm_model in n for n in names) or len(names) > 0
         except Exception:
             return False
+
+    @staticmethod
+    def _strip_think_and_fences(raw: str) -> str:
+        clean = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+        m = re.search(r"```(?:json|python)?\s*(.*?)```", clean, flags=re.S)
+        if m:
+            clean = m.group(1).strip()
+        return clean
+
+    def _chat_text(
+        self,
+        system: str,
+        user_text: str,
+        image: Image.Image | None = None,
+        temperature: float = 0.80,
+        max_tokens: int = 800,
+    ) -> str | None:
+        if image is not None:
+            b64 = _pil_to_b64_png(image)
+            user_content: object = [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]
+        else:
+            user_content = user_text
+
+        payload = {
+            "model": self.vlm_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        try:
+            resp = self._client.post(f"{self.api_base}/chat/completions", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return str(data["choices"][0]["message"]["content"])
+        except Exception as exc:
+            log.warning("Local VLM call failed (%s); using fallback.", exc)
+            return None
 
     def _chat_json(
         self,
@@ -251,31 +356,25 @@ class LocalVLMBrain:
         schema_cls: type[BaseModel],
         temperature: float = 0.80,
     ) -> BaseModel | None:
-        msg: dict = {"role": "user", "content": user_text}
-        if image is not None:
-            msg["images"] = [_pil_to_b64_png(image)]
-
-        payload = {
-            "model": self.vlm_model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system},
-                msg,
-            ],
-            "format": schema_cls.model_json_schema(),
-            "options": {
-                "temperature": temperature,
-                "num_predict": 280,
-            },
-        }
+        schema_hint = json.dumps(schema_cls.model_json_schema())
+        sys_full = (
+            f"{system}\nRespond with ONLY a single valid JSON object matching this schema "
+            f"(no extra text, no markdown):\n{schema_hint}"
+        )
+        raw = self._chat_text(sys_full, user_text, image=image, temperature=temperature, max_tokens=550)
+        if not raw:
+            return None
+        clean = self._strip_think_and_fences(raw)
+        # Extract outermost JSON object if extra prose leaked
+        if not clean.startswith("{"):
+            s = clean.find("{")
+            e = clean.rfind("}")
+            if s >= 0 and e > s:
+                clean = clean[s : e + 1]
         try:
-            resp = self._client.post(f"{self.ollama_url}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            raw = data["message"]["content"]
-            return schema_cls.model_validate_json(raw)
+            return schema_cls.model_validate_json(clean)
         except Exception as exc:
-            log.warning("Ollama VLM call failed (%s); using heuristic fallback.", exc)
+            log.warning("VLM JSON parse failed for %s (%s)", schema_cls.__name__, exc)
             return None
 
     def pareidolia_discover(
@@ -656,6 +755,152 @@ class LocalVLMBrain:
             ok = res.readable and res.quality_score >= 6 and exact_ok
             return ok, f"read='{res.read_text}' score={res.quality_score}/10 match={exact_ok} ok={ok}"
         return False, "ocr_check_failed"
+
+    def brainstorm_faction_batch(
+        self,
+        count: int = 8,
+        act: int = 1,
+        virtual_hour: float = 12.0,
+        prime_tz: str = "EUROPE",
+        unlocked_colors: tuple[int, ...] | list[int] | None = None,
+        existing_names: list[str] | None = None,
+        subreddit_hints: list[str] | None = None,
+    ) -> list[AIFactionIdea]:
+        """Ask the local 30B VLM to invent a diverse, non-repeating batch of r/place factions from scratch."""
+        col_names = (
+            [COLOR_NAMES[c] for c in unlocked_colors if 0 <= c < len(COLOR_NAMES)]
+            if unlocked_colors
+            else COLOR_NAMES
+        )
+        avoid = ", ".join((existing_names or [])[-40:]) or "none"
+        subs = ", ".join(f"r/{s}" for s in (subreddit_hints or [])[:6]) or "r/gaming, r/comics, r/cats, r/anime"
+
+        system = (
+            "You are the creative collective behind a giant live Reddit r/place simulation. "
+            "Invent genuinely human, playful, non-violent, culturally diverse pixel-art communities. "
+            "NEVER repeat previous names, NEVER use clichés (Radiant, Whirl, Cosmic, Vortex, Luminous), "
+            "and keep all text/slogans friendly, witty, and safe for work."
+        )
+        user_text = (
+            f"Current world state: Act {act} (Virtual Hour {virtual_hour:.1f}/72, prime-time region: {prime_tz}).\n"
+            f"Unlocked palette ({len(col_names)} colors): {', '.join(col_names)}.\n"
+            f"Optional subreddit inspiration: {subs}.\n"
+            f"Already taken names (DO NOT repeat or clone): {avoid}.\n\n"
+            f"Invent EXACTLY {count} wildly different new factions mixing:\n"
+            "- International communities (Chinese zh, Spanish es, French fr, German de, Japanese ja, Korean ko, Portuguese pt, Turkish tr) paired with their matching timezone_region and short native-language text/slogan!\n"
+            "- Pop-culture fandoms: TV shows, movies, superheroes, 90s/2000s cartoons, video games, anime, internet memes.\n"
+            "- At least 1 original funny 3-panel short pixel comic strip (art_mode='flux_comic', aspect='wide', fluid_cutout=false, describing Panel 1, Panel 2, Panel 3 with black borders & white gutters).\n"
+            "- At least 1 stylized multilingual or community text logo (art_mode='banner', aspect='wide', fluid_cutout=true, short 2-10 char banner_text in quotes).\n"
+            "- At least 1 visionless Geometric Chaos cult (art_mode='ai_code', fluid_cutout=true, pure abstract lines/lattices/spirals/beams/optical patterns — ZERO characters!).\n"
+            "- For ALL characters, mascots, superheroes, cartoons, memes, and logos, set fluid_cutout=true so they float organically without square boxes!\n\n"
+            "Return ONLY a JSON array of objects with keys: "
+            "name, timezone_region (AMERICAS|EUROPE|ASIA_PACIFIC|LATAM|GLOBAL), language, category, slogan, "
+            "art_mode (flux_art|flux_comic|banner|ai_code), aspect (square|wide|tall), fluid_cutout (bool), "
+            "banner_text, art_prompt (15-35 vivid visual words), primary_color, secondary_color, accent_color."
+        )
+
+        raw = self._chat_text(system, user_text, image=None, temperature=0.92, max_tokens=2400)
+        if not raw:
+            return []
+        clean = self._strip_think_and_fences(raw)
+        if not clean.startswith("["):
+            s, e = clean.find("["), clean.rfind("]")
+            if s >= 0 and e > s:
+                clean = clean[s : e + 1]
+        try:
+            items = json.loads(clean)
+            if not isinstance(items, list):
+                return []
+        except Exception as exc:
+            log.warning("brainstorm_faction_batch JSON parse failed (%s)", exc)
+            return []
+
+        seen_lower = {n.lower() for n in (existing_names or [])}
+        ideas: list[AIFactionIdea] = []
+        for obj in items:
+            if not isinstance(obj, dict):
+                continue
+            try:
+                idea = AIFactionIdea.model_validate(obj)
+            except Exception:
+                continue
+            nm = idea.name.strip()[:28]
+            if not nm or nm.lower() in seen_lower:
+                continue
+            if any(bad in nm.lower() for bad in _BANNED_CLICHES):
+                continue
+            # Enforce fluid cutouts for non-comics
+            if idea.art_mode != "flux_comic":
+                idea.fluid_cutout = True
+            seen_lower.add(nm.lower())
+            idea.name = nm
+            ideas.append(idea)
+        return ideas
+
+    def write_geometric_code(
+        self,
+        name: str,
+        art_prompt: str,
+        w: int,
+        h: int,
+        allowed_colors: tuple[int, ...] | list[int] | None = None,
+    ) -> str:
+        """Ask the local LLM to write a sandboxed Python draw(grid, w, h) script for geometric chaos art."""
+        cols = allowed_colors if allowed_colors else list(range(len(COLOR_NAMES)))
+        pal_desc = ", ".join(f"{c}={COLOR_NAMES[c]}" for c in cols if 0 <= c < len(COLOR_NAMES))
+        system = (
+            "You write compact, bug-free Python/NumPy pixel-art geometry functions. "
+            "Only use `np` and `math` (do NOT write import statements). Return ONLY a Python code block."
+        )
+        user_text = (
+            f"Write `def draw(grid, w, h):` that paints an original abstract geometric pixel pattern into `grid` "
+            f"(a numpy int16 array of shape (h, w) pre-filled with -1 for transparent).\n"
+            f"Faction: {name}\n"
+            f"Pattern idea: {art_prompt}\n"
+            f"Dimensions: {w}x{h}. Allowed color indices: {pal_desc}.\n"
+            "Leave outer edges irregular or transparent (-1) where appropriate so it flows fluidly onto the canvas (no boring solid rectangle box!)."
+        )
+        raw = self._chat_text(system, user_text, image=None, temperature=0.72, max_tokens=850)
+        return raw or ""
+
+    def invent_streamer_raid(
+        self,
+        timezone_region: str,
+        virtual_hour: float,
+        target_names: list[str],
+        unlocked_colors: tuple[int, ...] | list[int] | None = None,
+    ) -> AIFactionIdea | None:
+        """Invent a regional prime-time streamer flash-raid persona and bold die-cut raid emblem."""
+        col_names = (
+            [COLOR_NAMES[c] for c in unlocked_colors if 0 <= c < len(COLOR_NAMES)]
+            if unlocked_colors
+            else COLOR_NAMES
+        )
+        lang_hint = {
+            "EUROPE": "French, Spanish, German, or English",
+            "LATAM": "Spanish or Portuguese",
+            "ASIA_PACIFIC": "Japanese, Korean, Chinese, or English",
+            "AMERICAS": "English",
+            "GLOBAL": "English",
+        }.get(timezone_region, "English")
+        system = (
+            "You invent playful, energetic r/place streamer flash-raid mobs (like famous Twitch/YouTube community blitzes). "
+            "Keep content fun, safe, and non-violent."
+        )
+        user_text = (
+            f"Prime-time region: {timezone_region} (virtual hour {virtual_hour:.1f}/72, languages: {lang_hint}).\n"
+            f"Target territory currently held by: {', '.join(target_names[:4]) or 'established factions'}.\n"
+            f"Unlocked colors: {', '.join(col_names)}.\n"
+            "Invent 1 bold streamer flash-raid faction with a punchy raid slogan and vivid pixel-art mascot/emblem prompt "
+            "(art_mode='flux_art', aspect='square', fluid_cutout=true)."
+        )
+        res = self._chat_json(system, user_text, image=None, schema_cls=AIFactionIdea, temperature=0.92)
+        if isinstance(res, AIFactionIdea):
+            res.timezone_region = timezone_region  # type: ignore[assignment]
+            res.art_mode = "flux_art"
+            res.fluid_cutout = True
+            return res
+        return None
 
     def close(self) -> None:
         try:

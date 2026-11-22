@@ -20,8 +20,9 @@ def _crisp_downsample_to_palette(
     target_h: int,
     strip_bg: bool = True,
     add_outline: bool = True,
+    allowed_colors: tuple[int, ...] | list[int] | None = None,
 ) -> np.ndarray:
-    """Downsample a 512x512 diffusion image to crisp [target_h, target_w] palette grid.
+    """Downsample a diffusion image to crisp [target_h, target_w] palette grid.
 
     For cutout sprites (strip_bg=True), flood-strips border-connected background pixels
     using perceptual CIE-LAB tolerance so sprites float organically with NO rectangular box,
@@ -45,12 +46,13 @@ def _crisp_downsample_to_palette(
             cell = arr[cy0:cy1, cx0:cx1].reshape(-1, 3)
             out_rgb[j, i] = np.median(cell, axis=0).astype(np.uint8)
 
-    bp = rgb_to_palette_indices(out_rgb).astype(np.int16)
+    bp = rgb_to_palette_indices(out_rgb, allowed_colors=allowed_colors).astype(np.int16)
 
     if strip_bg:
         bp = _flood_strip_background_perceptual(bp)
         if add_outline and bool((bp < 0).any()):
-            bp = _add_1px_silhouette_outline(bp, BLACK_IDX)
+            outline_col = BLACK_IDX if (allowed_colors is None or BLACK_IDX in allowed_colors) else int(allowed_colors[0])
+            bp = _add_1px_silhouette_outline(bp, outline_col)
 
     return bp
 

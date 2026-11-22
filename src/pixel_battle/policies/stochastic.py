@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from pixel_battle.canvas import CanvasState
-from pixel_battle.factions import Faction
+from pixel_battle.factions import Faction, timezone_awake_factor
 from pixel_battle.palette import (
     BLACK_IDX,
     BURGUNDY_IDX,
@@ -44,6 +44,10 @@ class StochasticPolicy:
         self.num_users = num_users
         self.width = width
         self.height = height
+        self.active_w = width
+        self.active_h = height
+        self.virtual_hour_utc: float = 12.0
+        self.enable_timezones: bool = True
         self.base_cooldown = max(4, base_cooldown)
         self.device = device
 
@@ -107,7 +111,7 @@ class StochasticPolicy:
         self._heart_mask = heart
 
     def _sample_click_budgets(self, n: int, gen: torch.Generator | None = None) -> torch.Tensor:
-        """Sample real r/place heavy-tailed click budgets: 20% One-Shot(1), 50% casual(2-12), 24% regular(13-70), 6% veteran(71-350)."""
+        """Sample 1:1 r/place 2022 heavy-tailed click budgets (~15.5 mean px/user; 20% exact One-Shot)."""
         if gen is not None:
             u = torch.rand(n, generator=gen)
             v = torch.rand(n, generator=gen) ** 1.55
@@ -117,22 +121,77 @@ class StochasticPolicy:
             u = torch.rand(n, device=dev)
             v = torch.rand(n, device=dev) ** 1.55
 
-        casual = (2 + (v * 11.0).to(torch.int32)).clamp(2, 12)
-        regular = (13 + (v * 58.0).to(torch.int32)).clamp(13, 70)
-        veteran = (71 + (v * 280.0).to(torch.int32)).clamp(71, 350)
+        # 20% One-Shot (1), 54% casual (2-9), 21% regular (10-42), 5% veteran (45-240) -> ~15.5 mean
+        casual = (2 + (v * 8.0).to(torch.int32)).clamp(2, 9)
+        regular = (10 + (v * 33.0).to(torch.int32)).clamp(10, 42)
+        veteran = (45 + (v * 196.0).to(torch.int32)).clamp(45, 240)
 
         out = torch.ones(n, dtype=torch.int32, device=dev)
         out = torch.where(u >= 0.20, casual, out)
-        out = torch.where(u >= 0.70, regular, out)
-        out = torch.where(u >= 0.94, veteran, out)
+        out = torch.where(u >= 0.74, regular, out)
+        out = torch.where(u >= 0.95, veteran, out)
         return out.to(self.device)
 
-    def _consume_and_recycle_sessions(self, placed_slot_ids: torch.Tensor) -> None:
+    def _random_allowed_colors(self, n: int, canvas: CanvasState, non_white: bool = True) -> torch.Tensor:
+        cols = [c for c in canvas.allowed_colors if (not non_white or c != WHITE_IDX)]
+        if not cols:
+            return torch.full((n,), WHITE_IDX, dtype=torch.uint8, device=self.device)
+        pool = torch.tensor(cols, dtype=torch.uint8, device=self.device)
+        idx = torch.randint(0, len(cols), (n,), device=self.device)
+        return pool[idx]
+
+    def _clamp_colors_to_allowed(self, cols: torch.Tensor, canvas: CanvasState) -> torch.Tensor:
+        if canvas.palette_tier >= 4:
+            return torch.full_like(cols, WHITE_IDX)
+        if canvas.palette_tier == 3:
+            return cols
+        allowed = canvas.allowed_color_mask[cols.to(torch.long)]
+        if bool(allowed.all().item()):
+            return cols
+        repl = self._random_allowed_colors(int(cols.numel()), canvas, non_white=True)
+        return torch.where(allowed, cols, repl)
+
+    def _step_whiteout(
+        self,
+        ready_ids: torch.Tensor,
+        canvas: CanvasState,
+    ) -> PlacementBatch:
+        """Act 4 Whiteout Finale: every ready citizen places pure white, targeting remaining colored pixels."""
+        dev = self.device
+        n = int(ready_ids.numel())
+        W, H = canvas.active_w, canvas.active_h
+        # Coarse non-white density map so citizens sweep colored art cleanly back to pure white
+        stride = max(8, min(16, min(W, H) // 32))
+        non_white = (canvas.colors[:H, :W] != WHITE_IDX).to(torch.float32)
+        coarse = F.avg_pool2d(
+            non_white.unsqueeze(0).unsqueeze(0), kernel_size=stride, stride=stride
+        ).squeeze(0).squeeze(0)
+        ch, cw = coarse.shape
+        weights = (coarse + 0.015).flatten()
+        cell_idx = torch.multinomial(weights, n, replacement=True)
+        px = ((cell_idx % cw) * stride + torch.randint(0, stride, (n,), device=dev)).clamp(0, W - 1).to(torch.int32)
+        py = ((cell_idx // cw) * stride + torch.randint(0, stride, (n,), device=dev)).clamp(0, H - 1).to(torch.int32)
+        self.pos_x[ready_ids] = px
+        self.pos_y[ready_ids] = py
+        batch = PlacementBatch(
+            xs=px,
+            ys=py,
+            colors=torch.full((n,), WHITE_IDX, dtype=torch.uint8, device=dev),
+            factions=torch.full((n,), -1, dtype=torch.int16, device=dev),
+            user_ids=self.slot_user_ids[ready_ids].to(torch.int64),
+        )
+        self._consume_and_recycle_sessions(ready_ids, canvas=canvas)
+        return batch
+
+    def _consume_and_recycle_sessions(
+        self,
+        placed_slot_ids: torch.Tensor,
+        canvas: CanvasState | None = None,
+    ) -> None:
         """Decrement click budgets for slots that placed a pixel; recycle expired slots into brand-new unique user_ids."""
         if placed_slot_ids.numel() == 0:
             return
         dev = self.device
-        # Deduplicate just in case (normally unique within a single tick)
         self.remaining_clicks[placed_slot_ids] -= 1
         done_mask = self.remaining_clicks[placed_slot_ids] <= 0
         if not bool(done_mask.any().item()):
@@ -143,7 +202,6 @@ class StochasticPolicy:
         self.total_completed_sessions += n_done
         self.total_one_shot_sessions += n_one_shot
 
-        # Assign brand-new unique user IDs & fresh click budgets
         new_ids = torch.arange(
             self.next_user_id,
             self.next_user_id + n_done,
@@ -153,14 +211,19 @@ class StochasticPolicy:
         self.next_user_id += n_done
         self.total_unique_users += n_done
 
+        aw = canvas.active_w if canvas is not None else self.active_w
+        ah = canvas.active_h if canvas is not None else self.active_h
         new_budgets = self._sample_click_budgets(n_done)
         self.slot_user_ids[done_slots] = new_ids
         self.initial_clicks[done_slots] = new_budgets
         self.remaining_clicks[done_slots] = new_budgets
         self.user_factions[done_slots] = -1
-        self.pos_x[done_slots] = torch.randint(0, self.width, (n_done,), dtype=torch.int32, device=dev)
-        self.pos_y[done_slots] = torch.randint(0, self.height, (n_done,), dtype=torch.int32, device=dev)
-        self.pref_color[done_slots] = torch.randint(1, NUM_COLORS, (n_done,), dtype=torch.uint8, device=dev)
+        self.pos_x[done_slots] = torch.randint(0, aw, (n_done,), dtype=torch.int32, device=dev)
+        self.pos_y[done_slots] = torch.randint(0, ah, (n_done,), dtype=torch.int32, device=dev)
+        if canvas is not None:
+            self.pref_color[done_slots] = self._random_allowed_colors(n_done, canvas, non_white=True)
+        else:
+            self.pref_color[done_slots] = torch.randint(1, NUM_COLORS, (n_done,), dtype=torch.uint8, device=dev)
         self.loyalty[done_slots] = 0.25 + 0.70 * torch.rand(n_done, device=dev)
 
     def get_population_stats(self) -> dict[str, float | int]:
@@ -184,6 +247,8 @@ class StochasticPolicy:
         factions: list[Faction],
         shared_borders: list[tuple[int, int, tuple[int, int, int, int]]],
     ) -> PlacementBatch:
+        self.active_w = canvas.active_w
+        self.active_h = canvas.active_h
         self.cooldown -= 1
         ready_mask = self.cooldown <= 0
         ready_ids = torch.nonzero(ready_mask, as_tuple=False).squeeze(-1)
@@ -205,6 +270,10 @@ class StochasticPolicy:
             lo, hi, (ready_ids.numel(),), dtype=torch.int32, device=self.device
         )
 
+        # Act 4 Whiteout Finale: lock every placement to pure white sweeping remaining colored pixels
+        if canvas.is_whiteout:
+            return self._step_whiteout(ready_ids, canvas)
+
         out_xs: list[torch.Tensor] = []
         out_ys: list[torch.Tensor] = []
         out_cols: list[torch.Tensor] = []
@@ -218,8 +287,9 @@ class StochasticPolicy:
         free_u = ready_ids[ready_fac == -1]
         if free_u.numel() > 0:
             fx, fy, fc = self._step_free_agents(free_u, canvas)
-            out_xs.append(fx)
-            out_ys.append(fy)
+            fc = self._clamp_colors_to_allowed(fc, canvas)
+            out_xs.append(fx.clamp(0, canvas.active_w - 1))
+            out_ys.append(fy.clamp(0, canvas.active_h - 1))
             out_cols.append(fc)
             out_facs.append(torch.full((free_u.numel(),), -1, dtype=torch.int16, device=self.device))
             out_uids.append(self.slot_user_ids[free_u].to(torch.int64))
@@ -232,7 +302,7 @@ class StochasticPolicy:
             borders_by_fac.setdefault(fa, []).append((fb, rect))
             borders_by_fac.setdefault(fb, []).append((fa, rect))
 
-        # O(N_ready) grouping of faction members so 200+ factions don't scan ready_fac 200 times
+        # O(N_ready) grouping of faction members
         org_mask = ready_fac >= 0
         if bool(org_mask.any().item()):
             org_u = ready_ids[org_mask]
@@ -253,15 +323,28 @@ class StochasticPolicy:
                     self.user_factions[u_idx] = -1
                     continue
 
+                # Apply regional timezone sleep/wake modulation
+                eff_cnt = cnt
+                if self.enable_timezones and not fac.is_void and not fac.is_streamer_raid:
+                    awake = timezone_awake_factor(fac.timezone_region, self.virtual_hour_utc)
+                    if awake < 0.98:
+                        eff_cnt = max(0, int(round(cnt * awake)))
+                        if eff_cnt == 0:
+                            continue
+                        u_idx = u_idx[:eff_cnt]
+
                 if fac.is_void:
-                    vx, vy, vc = self._step_void_faction(fac, cnt, canvas)
+                    vx, vy, vc = self._step_void_faction(fac, eff_cnt, canvas)
                 else:
                     vx, vy, vc = self._step_art_faction(
-                        tick, fac, cnt, canvas, fac_by_id, borders_by_fac.get(fac.id, [])
+                        tick, fac, eff_cnt, canvas, fac_by_id, borders_by_fac.get(fac.id, [])
                     )
 
                 n_out = int(vx.numel())
                 if n_out > 0:
+                    vc = self._clamp_colors_to_allowed(vc, canvas)
+                    vx = vx.clamp(0, canvas.active_w - 1)
+                    vy = vy.clamp(0, canvas.active_h - 1)
                     used_slots = u_idx[:n_out]
                     self.pos_x[used_slots] = vx
                     self.pos_y[used_slots] = vy
@@ -289,8 +372,7 @@ class StochasticPolicy:
             factions=torch.cat(out_facs),
             user_ids=torch.cat(out_uids),
         )
-        # Recycle finished sessions after emitting their user_id into the batch
-        self._consume_and_recycle_sessions(torch.cat(placed_slots_list))
+        self._consume_and_recycle_sessions(torch.cat(placed_slots_list), canvas=canvas)
         return batch
 
     def _step_free_agents(
@@ -298,23 +380,24 @@ class StochasticPolicy:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n = int(u_ids.numel())
         dev = self.device
-        W, H = self.width, self.height
+        W, H = canvas.active_w, canvas.active_h
 
-        # 12% jump toward trending activity hotspots or flush corners
+        # 12% jump toward trending activity hotspots or flush corners inside active viewport
         jump_mask = torch.rand(n, device=dev) < 0.12
-        x = self.pos_x[u_ids].clone()
-        y = self.pos_y[u_ids].clone()
+        x = self.pos_x[u_ids].clamp(0, W - 1).clone()
+        y = self.pos_y[u_ids].clamp(0, H - 1).clone()
 
         n_jump = int(jump_mask.sum().item())
         if n_jump > 0:
+            act_view = canvas.activity[:H, :W]
             pool_w = max(1, W // 16)
             coarse = F.avg_pool2d(
-                canvas.activity.unsqueeze(0).unsqueeze(0), kernel_size=16, stride=16
+                act_view.unsqueeze(0).unsqueeze(0), kernel_size=16, stride=16
             ).flatten()
             probs = coarse + 0.08
             cell_idx = torch.multinomial(probs, n_jump, replacement=True)
-            cy = (cell_idx // pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)
-            cx = (cell_idx % pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)
+            cy = ((cell_idx // pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)).clamp(0, H - 1)
+            cx = ((cell_idx % pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)).clamp(0, W - 1)
             x[jump_mask] = cx.to(torch.int32)
             y[jump_mask] = cy.to(torch.int32)
 
@@ -366,7 +449,7 @@ class StochasticPolicy:
         colors = torch.where(m2 & (~parity), alt_col, colors)
 
         m3 = (traits == 3) & (torch.rand(n, device=dev) < 0.30)
-        rand_col = torch.randint(1, NUM_COLORS, (n,), dtype=torch.uint8, device=dev)
+        rand_col = self._random_allowed_colors(n, canvas)
         colors = torch.where(m3, rand_col, colors)
 
         touches_black = (nbrs == BLACK_IDX).any(dim=1)
@@ -514,7 +597,7 @@ class StochasticPolicy:
         my_borders: list[tuple[int, tuple[int, int, int, int]]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dev = self.device
-        W, H = self.width, self.height
+        W, H = canvas.active_w, canvas.active_h
 
         # 1. Active Raid on a rival neighbor
         if fac.raid_target_id is not None and fac.raid_target_id in fac_by_id:
@@ -554,17 +637,18 @@ class StochasticPolicy:
 
             if k_rest == 0:
                 return hx, hy, hc
-            ox, oy, oc = self._expand_perimeter(fac, k_rest)
+            ox, oy, oc = self._expand_perimeter(fac, k_rest, canvas)
             return torch.cat([hx, ox]), torch.cat([hy, oy]), torch.cat([hc, oc])
 
-        return self._expand_perimeter(fac, k)
+        return self._expand_perimeter(fac, k, canvas)
 
     def _expand_perimeter(
-        self, fac: Faction, k: int
+        self, fac: Faction, k: int, canvas: CanvasState | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Organic territory growth hugging the silhouette or clean-space/ribbon frontier."""
         dev = self.device
-        W, H = self.width, self.height
+        W = canvas.active_w if canvas is not None else self.active_w
+        H = canvas.active_h if canvas is not None else self.active_h
 
         # Clean-space purists keep erasing 1-2px outside their blank enclave cleanly in WHITE_IDX
         if fac.art_mode == "clean_space":
@@ -573,7 +657,7 @@ class StochasticPolicy:
             return rx, ry, torch.full((k,), WHITE_IDX, dtype=torch.uint8, device=dev)
 
         # Keep micro-sprites, paintings, comic strips, and cartoon memes crisp inside their outline
-        if fac.size_tier == "micro" or fac.art_mode in ("painting", "comic_strip", "cartoon_meme"):
+        if fac.size_tier == "micro" or fac.art_mode in ("painting", "comic_strip", "flux_comic", "cartoon_meme"):
             rx = torch.randint(fac.x0, max(fac.x0 + 1, fac.x1), (k,), dtype=torch.int32, device=dev)
             ry = torch.randint(fac.y0, max(fac.y0 + 1, fac.y1), (k,), dtype=torch.int32, device=dev)
             bp_c = fac.blueprint[(ry - fac.y0).clamp(0, fac.h - 1), (rx - fac.x0).clamp(0, fac.w - 1)]
@@ -601,21 +685,24 @@ class StochasticPolicy:
                 col_idx = fac.blueprint[torch.zeros(k, dtype=torch.long, device=dev), (rx - fac.x0).clamp(0, fac.w - 1)].clamp(0, NUM_COLORS - 1).to(torch.uint8)
                 return rx, tip, col_idx
 
-        # Run silhouette halo expansion only on transparent cutouts to avoid .item() stalls on solid flags
-        if fac.art_mode in ("diffusion", "procedural", "banner", "fractal", "black_hole", "void_monster"):
-            bp = fac.blueprint
-            valid = bp >= 0
-            vf = valid.to(torch.float32)
-            dil = torch.zeros_like(vf)
-            h, w = fac.h, fac.w
-            if h > 1:
-                dil[1:, :] += vf[:-1, :]
-                dil[:-1, :] += vf[1:, :]
-            if w > 1:
-                dil[:, 1:] += vf[:, :-1]
-                dil[:, :-1] += vf[:, 1:]
-            halo = (dil > 0) & (~valid)
-            h_idx = torch.nonzero(halo, as_tuple=False)
+        # Run silhouette halo expansion using cached halo coords (zero per-tick MPS torch.nonzero stalls)
+        if fac.art_mode in ("flux_art", "ai_code", "streamer_raid", "diffusion", "procedural", "banner", "fractal", "black_hole", "void_monster"):
+            h_idx = fac._halo_xy_cache
+            if h_idx is None:
+                bp = fac.blueprint
+                valid = bp >= 0
+                vf = valid.to(torch.float32)
+                dil = torch.zeros_like(vf)
+                h, w = fac.h, fac.w
+                if h > 1:
+                    dil[1:, :] += vf[:-1, :]
+                    dil[:-1, :] += vf[1:, :]
+                if w > 1:
+                    dil[:, 1:] += vf[:, :-1]
+                    dil[:, :-1] += vf[:, 1:]
+                halo = (dil > 0) & (~valid)
+                h_idx = torch.nonzero(halo, as_tuple=False)
+                fac._halo_xy_cache = h_idx
             if h_idx.shape[0] > 0:
                 pick = torch.randint(0, h_idx.shape[0], (k,), device=dev)
                 ly = h_idx[pick, 0] + torch.randint(-2, 3, (k,), device=dev)
@@ -693,8 +780,8 @@ class StochasticPolicy:
             if not bool(is_void_pix.any().item()):
                 cx = torch.full((k_tendril,), (x0 + x1) // 2, dtype=torch.int32, device=dev) + torch.randint(-3, 4, (k_tendril,), dtype=torch.int32, device=dev)
                 cy = torch.full((k_tendril,), (y0 + y1) // 2, dtype=torch.int32, device=dev) + torch.randint(-3, 4, (k_tendril,), dtype=torch.int32, device=dev)
-                xs_parts.append(cx.clamp(0, self.width - 1))
-                ys_parts.append(cy.clamp(0, self.height - 1))
+                xs_parts.append(cx.clamp(0, canvas.active_w - 1))
+                ys_parts.append(cy.clamp(0, canvas.active_h - 1))
                 cs_parts.append(torch.full((k_tendril,), BLACK_IDX, dtype=torch.uint8, device=dev))
             else:
                 vf = is_void_pix.to(torch.float32)
@@ -762,47 +849,75 @@ class StochasticPolicy:
         self.pos_y[chosen] = torch.randint(faction.y0, max(faction.y0 + 1, faction.y1), (take,), dtype=torch.int32, device=self.device)
         return take
 
+    def mobilize_flash_raid(self, faction: Faction, target_count: int) -> int:
+        """Rally a temporary streamer flash-raid surge from free agents and low-loyalty citizens."""
+        not_one_shot = self.initial_clicks > 1
+        pool_mask = not_one_shot & ((self.user_factions == -1) | (self.loyalty < 0.55))
+        pool = torch.nonzero(pool_mask, as_tuple=False).squeeze(-1)
+        if pool.numel() == 0:
+            return 0
+        take = min(target_count, max(1, int(pool.numel() * 0.22)))
+        perm = torch.randperm(pool.numel(), device=self.device)[:take]
+        chosen = pool[perm]
+        self.user_factions[chosen] = faction.id
+        self.pos_x[chosen] = torch.randint(faction.x0, max(faction.x0 + 1, faction.x1), (take,), dtype=torch.int32, device=self.device)
+        self.pos_y[chosen] = torch.randint(faction.y0, max(faction.y0 + 1, faction.y1), (take,), dtype=torch.int32, device=self.device)
+        # Wake raiders immediately for dramatic blitz speed
+        self.cooldown[chosen] = torch.randint(1, max(3, self.base_cooldown // 2), (take,), dtype=torch.int32, device=self.device)
+        return take
+
     def social_step(self, factions: list[Faction], canvas: CanvasState) -> None:
-        """Area-proportional recruitment of multi-click free agents + defection from losing factions."""
+        """Area-proportional recruitment of multi-click free agents + burnout defection from fading factions."""
         alive = [f for f in factions if f.alive]
         if not alive:
             return
         dev = self.device
 
-        # Keep >= 16% of online slots as free agents (including all One-Shot tourists)
+        # Keep >= 14% of online slots as free agents (including all One-Shot tourists)
         eligible_mask = (self.user_factions == -1) & (self.initial_clicks > 1)
         free_ids = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
-        min_free_eligible = int(self.num_users * 0.12)
+        min_free_eligible = int(self.num_users * 0.14)
 
         if free_ids.numel() > min_free_eligible:
-            recruit_budget = min(int((free_ids.numel() - min_free_eligible) * 0.14), 480)
+            recruit_budget = min(int((free_ids.numel() - min_free_eligible) * 0.16), max(480, self.num_users // 80))
             if recruit_budget > 0:
                 perm = torch.randperm(free_ids.numel(), device=dev)[:recruit_budget]
                 candidates = free_ids[perm]
                 w_vals = []
                 for f in alive:
-                    cap = 1500 if f.is_void else _TIER_MEMBER_CAP.get(f.size_tier, 360)
-                    headroom = max(0.04, 1.0 - (f.member_count / max(1.0, float(cap))))
+                    cap = 3500 if (f.is_void or f.is_streamer_raid) else _TIER_MEMBER_CAP.get(f.size_tier, 360)
+                    headroom = max(0.03, 1.0 - (f.member_count / max(1.0, float(cap))))
                     area_w = math.sqrt(max(100.0, float(f.w * f.h))) / 40.0
-                    wt = max(0.05, f.hype * (0.45 + f.morale) * area_w * headroom * (1.5 if f.is_void else 1.0))
+                    awake = timezone_awake_factor(f.timezone_region, self.virtual_hour_utc) if self.enable_timezones else 1.0
+                    wt = max(0.02, f.hype * (0.40 + f.morale) * area_w * headroom * awake * (1.8 if f.is_void else 1.0))
                     w_vals.append(wt)
                 weights = torch.tensor(w_vals, dtype=torch.float32, device=dev)
                 fac_choices = torch.multinomial(weights, recruit_budget, replacement=True)
                 fac_ids_t = torch.tensor([f.id for f in alive], dtype=torch.int16, device=dev)
                 self.user_factions[candidates] = fac_ids_t[fac_choices]
 
-        # Defection: low-morale / crushed factions lose disloyal members back to free agents
-        for f in alive:
-            if f.morale < 0.52:
-                m_idx = torch.nonzero(self.user_factions == f.id, as_tuple=False).squeeze(-1)
-                if m_idx.numel() == 0:
+        # Vectorized defection for low-morale or burning-out factions (scales cleanly to 1,200+ factions)
+        weak_ids = [f.id for f in alive if (not f.is_streamer_raid) and (f.morale < 0.52 or f.hype < 0.35)]
+        if weak_ids:
+            max_id = max(f.id for f in alive) + 1
+            churn_lut = torch.zeros(max_id, dtype=torch.float32, device=dev)
+            loy_lut = torch.zeros(max_id, dtype=torch.float32, device=dev)
+            for f in alive:
+                if f.is_streamer_raid:
                     continue
-                churn_rate = 0.04 if f.morale > 0.35 else 0.11
-                leave = (torch.rand(m_idx.numel(), device=dev) < churn_rate) & (
-                    self.loyalty[m_idx] < (0.85 - f.morale * 0.4)
-                )
-                if leave.any():
-                    self.user_factions[m_idx[leave]] = -1
+                if f.morale < 0.52 or f.hype < 0.35:
+                    burn_extra = 0.08 if f.hype < 0.35 else 0.0
+                    churn_lut[f.id] = (0.04 if f.morale > 0.35 else 0.12) + burn_extra
+                    loy_lut[f.id] = 0.88 - f.morale * 0.35
+            org_m = self.user_factions >= 0
+            org_idx = torch.nonzero(org_m, as_tuple=False).squeeze(-1)
+            if org_idx.numel() > 0:
+                fids = self.user_factions[org_idx].to(torch.long).clamp(0, max_id - 1)
+                rates = churn_lut[fids]
+                thresh = loy_lut[fids]
+                leave = (rates > 0.0) & (torch.rand(org_idx.numel(), device=dev) < rates) & (self.loyalty[org_idx] < thresh)
+                if bool(leave.any().item()):
+                    self.user_factions[org_idx[leave]] = -1
 
     def release_faction_members(self, faction_id: int) -> None:
         mask = self.user_factions == faction_id

@@ -258,6 +258,7 @@ DASHBOARD_HTML = """<!doctype html>
 <header>
   <div class="brand">
     <span>PIXEL BATTLE</span>
+    <span class="pill" id="statAct">Act 1 · Hr 0.0/72</span>
     <span class="pill" id="statTick">Tick 0</span>
     <span class="pill" id="statPix">0 px</span>
     <span class="pill" id="statRate">0 px/s</span>
@@ -437,13 +438,15 @@ function drawOverlay() {
 
 function renderPanels() {
   if (!state) return;
-  document.getElementById("statTick").textContent = `Tick ${state.tick.toLocaleString()} / ${state.max_ticks.toLocaleString()}`;
+  const actPal = state.palette_size === 1 ? "Whiteout" : `${state.palette_size}c`;
+  document.getElementById("statAct").textContent = `Act ${state.act || 1} · Hr ${(state.virtual_hour || 0).toFixed(1)}/72 · ${state.active_w || state.width}x${state.active_h || state.height} · ${actPal}`;
+  document.getElementById("statTick").textContent = `Tick ${state.tick.toLocaleString()}`;
   document.getElementById("statPix").textContent = `${state.total_placements.toLocaleString()} px`;
   document.getElementById("statRate").textContent = `${state.pixels_per_sec.toLocaleString()} px/s (${state.actual_tps} tps)`;
-  document.getElementById("brainStatus").textContent = `${state.device.toUpperCase()} · ${state.policy_name || "policy"} · ${state.brain_status}`;
+  document.getElementById("brainStatus").textContent = `${state.device.toUpperCase()} · ${state.policy_name || "policy"} · ${state.ai_faction_pct || 0}% AI · ${state.brain_status}`;
   document.getElementById("epochReadout").textContent = `Epoch ${state.epoch}`;
   document.getElementById("btnPause").textContent = state.paused ? "Resume" : "Pause";
-  document.getElementById("facSummary").textContent = `${state.factions.length} factions · ${state.free_agents.toLocaleString()} free`;
+  document.getElementById("facSummary").textContent = `${state.total_active_factions || state.factions.length} factions · ${state.free_agents.toLocaleString()} free`;
 
   const fList = document.getElementById("factionList");
   fList.innerHTML = state.factions.map(f => `
@@ -528,7 +531,7 @@ def create_app(engine: SimulationEngine) -> FastAPI:
     @app.get("/api/canvas.png")
     def get_canvas_png() -> Response:
         with engine._state_lock:
-            rgb = engine.canvas.to_rgb_numpy()
+            rgb = engine.canvas.to_rgb_numpy(active_only=False)
         buf = io.BytesIO()
         Image.fromarray(rgb, mode="RGB").save(buf, format="PNG", compress_level=1)
         return Response(

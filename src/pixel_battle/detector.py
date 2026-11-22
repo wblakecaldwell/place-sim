@@ -60,17 +60,26 @@ def find_pareidolia_candidates(
     top_k: int = 2,
     allow_cameo: bool = False,
     rng: random.Random | None = None,
+    prefer_region: tuple[int, int, int, int] | None = None,
 ) -> list[ClusterCandidate]:
-    """Scan unclaimed regions (including flush corners, edges, tight micro-gaps, and optional flag cameos)."""
-    colors = canvas.colors_numpy()
-    activity = canvas.activity_numpy()
-    H, W = colors.shape
+    """Scan unclaimed regions inside the active viewport (flush corners, edges, tight micro-gaps, optional cameos)."""
+    H, W = canvas.active_h, canvas.active_w
+    colors = canvas.colors[:H, :W].detach().cpu().numpy()
+    activity = canvas.activity[:H, :W].detach().cpu().numpy()
     window = max(12, min(window, min(H, W)))
-    stride = max(6, stride)
+    # Scale stride gently on 2000x2000 so discovery scans stay sub-20ms
+    min_stride = max(6, int(max(W, H) // 64))
+    stride = max(min_stride, stride)
 
     occupied = _build_occupancy_mask(H, W, factions, exclude_host_flags=False)
-    xs = sorted(set(list(range(0, max(1, W - window), stride)) + [max(0, W - window)]))
-    ys = sorted(set(list(range(0, max(1, H - window), stride)) + [max(0, H - window)]))
+    rx0, ry0, rx1, ry1 = prefer_region if prefer_region is not None else (0, 0, W, H)
+    rx0, ry0 = max(0, rx0), max(0, ry0)
+    rx1, ry1 = min(W, rx1), min(H, ry1)
+    if rx1 - rx0 < window or ry1 - ry0 < window:
+        rx0, ry0, rx1, ry1 = 0, 0, W, H
+
+    xs = sorted(set(list(range(rx0, max(rx0 + 1, rx1 - window), stride)) + [max(rx0, rx1 - window)]))
+    ys = sorted(set(list(range(ry0, max(ry0 + 1, ry1 - window), stride)) + [max(ry0, ry1 - window)]))
 
     alive_edge_count = sum(
         1 for f in factions if f.alive and not f.is_void and (f.x0 == 0 or f.y0 == 0 or f.x1 >= W or f.y1 >= H)
@@ -197,8 +206,8 @@ def find_ribbon_track(
     thickness: int,
     rng: random.Random,
 ) -> tuple[int, int, int, int]:
-    """Pick a starting (x0, y0, init_w, init_h) for a progressive Transverse Ribbon avoiding existing tracks."""
-    H, W = canvas.height, canvas.width
+    """Pick a starting (x0, y0, init_w, init_h) for a progressive Transverse Ribbon inside the active viewport."""
+    H, W = canvas.active_h, canvas.active_w
     existing_h = [f.y0 for f in factions if f.alive and f.art_mode == "ribbon" and f.ribbon_axis == "h"]
     existing_v = [f.x0 for f in factions if f.alive and f.art_mode == "ribbon" and f.ribbon_axis == "v"]
 
@@ -242,7 +251,7 @@ def update_faction_metrics(
     factions: list[Faction],
     user_factions: torch.Tensor,
 ) -> None:
-    """Recompute each faction's member count, blueprint integrity, owned pixels, and churn."""
+    """Recompute each faction's member count, blueprint integrity, owned pixels, and churn without per-faction GPU stalls."""
     if not factions:
         return
     valid_u = user_factions[user_factions >= 0]
@@ -252,15 +261,18 @@ def update_faction_metrics(
         if valid_u.numel() > 0
         else np.zeros(max_id, dtype=np.int64)
     )
-    owner_grid = canvas.owner
-
-    # Vectorized owner pixel count (avoids 200 full-grid equality scans)
+    owner_grid = canvas.owner[: canvas.active_h, : canvas.active_w]
     valid_o = owner_grid[owner_grid >= 0]
     owned_counts = (
         torch.bincount(valid_o.to(torch.int64), minlength=max_id).detach().cpu().numpy()
         if valid_o.numel() > 0
         else np.zeros(max_id, dtype=np.int64)
     )
+
+    # Single bulk GPU->CPU transfer avoids O(N_factions) MPS pipeline syncs at 1,200+ factions
+    colors_np = canvas.colors[: canvas.active_h, : canvas.active_w].detach().cpu().numpy().astype(np.int16, copy=False)
+    act_np = canvas.activity[: canvas.active_h, : canvas.active_w].detach().cpu().numpy()
+    ah, aw = colors_np.shape
 
     for f in factions:
         if not f.alive:
@@ -269,18 +281,27 @@ def update_faction_metrics(
         f.member_count = int(counts[f.id]) if f.id < len(counts) else 0
         f.owned_pixels = int(owned_counts[f.id]) if f.id < len(owned_counts) else 0
 
-        crop_colors = canvas.colors[f.y0 : f.y1, f.x0 : f.x1].to(torch.int16)
-        crop_act = canvas.activity[f.y0 : f.y1, f.x0 : f.x1]
-        f.recent_churn = float(crop_act.mean().item())
+        y0, y1 = max(0, f.y0), min(ah, f.y1)
+        x0, x1 = max(0, f.x0), min(aw, f.x1)
+        if y1 <= y0 or x1 <= x0:
+            f.integrity = 0.0
+            continue
+        crop_colors = colors_np[y0:y1, x0:x1]
+        f.recent_churn = float(act_np[y0:y1, x0:x1].mean())
 
         if f.is_void and f.void_variant == "tendrils":
-            black_frac = float((crop_colors == BLACK_IDX).to(torch.float32).mean().item())
-            f.integrity = black_frac
+            f.integrity = float((crop_colors == BLACK_IDX).mean())
         else:
-            valid = f.blueprint >= 0
-            total_valid = int(valid.sum().item())
-            if total_valid > 0 and crop_colors.shape == f.blueprint.shape:
-                matched = int(((crop_colors == f.blueprint) & valid).sum().item())
+            bp_np = getattr(f, "_bp_cpu_cache", None)
+            if bp_np is None or bp_np.shape != (f.h, f.w):
+                bp_np = f.blueprint.detach().cpu().numpy()
+                f._bp_cpu_cache = bp_np  # type: ignore[attr-defined]
+            bh, bw = crop_colors.shape
+            bp_sub = bp_np[:bh, :bw]
+            valid = bp_sub >= 0
+            total_valid = int(valid.sum())
+            if total_valid > 0:
+                matched = int(((crop_colors == bp_sub) & valid).sum())
                 f.integrity = matched / total_valid
             else:
                 f.integrity = 0.0
@@ -295,21 +316,28 @@ def find_open_exodus_spot(
     w: int,
     h: int,
     exclude_faction_id: int = -1,
+    prefer_region: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int]:
-    """Find the least-contested (x0, y0) rectangle (including flush edges/corners) for exodus."""
-    H, W = canvas.height, canvas.width
+    """Find the least-contested (x0, y0) rectangle inside the active viewport for exodus or fresh placement."""
+    H, W = canvas.active_h, canvas.active_w
     occupied = np.zeros((H, W), dtype=np.float32)
     for f in factions:
         if not f.alive or f.id == exclude_faction_id:
             continue
-        occupied[f.y0 : f.y1, f.x0 : f.x1] += 1.0
+        occupied[max(0, f.y0) : min(H, f.y1), max(0, f.x0) : min(W, f.x1)] += 1.0
+
+    rx0, ry0, rx1, ry1 = prefer_region if prefer_region is not None else (0, 0, W, H)
+    rx0, ry0 = max(0, rx0), max(0, ry0)
+    rx1, ry1 = min(W, rx1), min(H, ry1)
+    if rx1 - rx0 < w or ry1 - ry0 < h:
+        rx0, ry0, rx1, ry1 = 0, 0, W, H
 
     best_score = 1e9
-    best_pos = (0, 0)
-    step = 16 if max(w, h) <= 32 else 24
-    xs = sorted(set(list(range(0, max(1, W - w), step)) + [max(0, W - w)]))
-    ys = sorted(set(list(range(0, max(1, H - h), step)) + [max(0, H - h)]))
-    act = canvas.activity_numpy()
+    best_pos = (rx0, ry0)
+    step = max(16, int(max(W, H) // 48))
+    xs = sorted(set(list(range(rx0, max(rx0 + 1, rx1 - w), step)) + [max(rx0, rx1 - w)]))
+    ys = sorted(set(list(range(ry0, max(ry0 + 1, ry1 - h), step)) + [max(ry0, ry1 - h)]))
+    act = canvas.activity[:H, :W].detach().cpu().numpy()
     for y0 in ys:
         for x0 in xs:
             occ = float(occupied[y0 : y0 + h, x0 : x0 + w].mean())
@@ -322,13 +350,14 @@ def find_open_exodus_spot(
 
 
 def find_void_spawn_spot(canvas: CanvasState, factions: list[Faction], size: int = 84) -> tuple[int, int]:
-    """Pick a contested border or busy art edge for a Void / Black Hole / Monster eruption."""
-    H, W = canvas.height, canvas.width
-    act = canvas.activity_numpy()
+    """Pick a contested border or busy art edge inside the active viewport for a Void eruption."""
+    H, W = canvas.active_h, canvas.active_w
+    act = canvas.activity[:H, :W].detach().cpu().numpy()
     best_score = -1.0
-    best_pos = (W // 2 - size // 2, H // 2 - size // 2)
-    for y0 in range(0, max(1, H - size + 1), 28):
-        for x0 in range(0, max(1, W - size + 1), 28):
+    best_pos = (max(0, W // 2 - size // 2), max(0, H // 2 - size // 2))
+    step = max(28, int(max(W, H) // 36))
+    for y0 in range(0, max(1, H - size + 1), step):
+        for x0 in range(0, max(1, W - size + 1), step):
             s = float(act[y0 : y0 + size, x0 : x0 + size].mean())
             if s > best_score:
                 best_score = s

@@ -1,4 +1,4 @@
-"""Main simulation engine uniting GPU MPS pixel loop, 200-faction power-law ecosystem, progressive ribbons, 4-variant Void, and async VLM/diffusion strategist."""
+"""Main simulation engine uniting GPU MPS pixel loop, 4-act r/place expansion, AI-first factions, timezones, flash-raids, and async VLM/FLUX strategist."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import queue
 import random
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,7 @@ from pixel_battle.art.sprites import (
     generate_void_monster,
 )
 from pixel_battle.art.typography import FONT_STYLES, TypographyStyleSpec
-from pixel_battle.brain import COLOR_THEMES, FactionDecision, LocalVLMBrain
+from pixel_battle.brain import AIFactionIdea, COLOR_THEMES, FactionDecision, LocalVLMBrain
 from pixel_battle.canvas import CanvasState
 from pixel_battle.config import SimConfig
 from pixel_battle.detector import (
@@ -48,10 +48,12 @@ from pixel_battle.detector import (
 from pixel_battle.events import EventLogger
 from pixel_battle.factions import (
     DiplomacyBoard,
+    FLAG_TIMEZONES,
     Faction,
     compute_edge_weights,
     compute_shared_border_rect,
     describe_neighbors,
+    timezone_awake_factor,
 )
 from pixel_battle.palette import (
     BLACK_IDX,
@@ -59,13 +61,10 @@ from pixel_battle.palette import (
     BURGUNDY_IDX,
     COLOR_NAMES,
     DARK_RED_IDX,
-    GREEN_IDX,
-    ORANGE_IDX,
-    PINK_IDX,
     PURPLE_IDX,
-    RED_IDX,
     WHITE_IDX,
     YELLOW_IDX,
+    remap_indices_to_allowed,
     resolve_color,
 )
 from pixel_battle.policies.base import PixelPolicy
@@ -83,48 +82,31 @@ _DIR_MAP: dict[str, tuple[int, int]] = {
     "NONE": (0, 0),
 }
 
-# Empirical placeAtlas 2017/2022/2023 size-tier shares (REQ-SIM-010)
+# Empirical placeAtlas size-tier shares (REQ-SIM-010)
 _TIER_TARGETS: dict[str, float] = {
-    "micro": 0.60,
-    "medium": 0.24,
+    "micro": 0.58,
+    "medium": 0.27,
     "macro": 0.12,
-    "ribbon": 0.04,
+    "ribbon": 0.03,
 }
 
-# Per-tier max expansion dimensions so Micro & Medium factions stay properly scaled
-_TIER_MAX_DIM: dict[str, tuple[int, int]] = {
-    "micro": (28, 28),
-    "medium": (58, 58),
-    "macro": (112, 112),
-    "ribbon": (512, 512),
-}
-
-_LOGO_WORDMARKS: list[tuple[str, str]] = [
-    ("STONKS", "Pixel portfolio only goes up."),
-    ("BONK!", "No chaos near the comic district."),
-    ("r/MEMES", "Meme headquarters on the grid."),
-    ("r/COMICS", "Daily pixel comic strips."),
-    ("PIXEL", "One pixel at a time."),
-    ("ARCADE", "Insert coin to paint."),
-    ("LO-FI", "Chill beats and clean pixels."),
-    ("DOGE", "Much color, very art, wow."),
-    ("MEOW", "Feline pixel sanctuary."),
-    ("RETRO", "16-bit nostalgia forever."),
-    ("HOLD FAST", "Hold the line against the Void."),
-    ("NO VOID", "Keep the canvas bright."),
-    ("VIBES", "Good vibes across the border."),
-    ("GG EZ", "Well played, neighbors."),
-    ("CHILL", "Relaxed pixel builders."),
-    ("r/CATS", "Cats rule the canvas."),
-    ("r/GAMING", "Press start to defend."),
-    ("r/ANIME", "Chibi alliance united."),
-    ("TOON", "Saturday morning pixel squad."),
-    ("BRUH", "Who painted over my corner?"),
+_LOGO_WORDMARKS: list[tuple[str, str, str, str]] = [
+    ("像素联盟", "一起守护像素画布！", "ASIA_PACIFIC", "zh"),
+    ("¡VIVA!", "Colores unidos en el lienzo.", "LATAM", "es"),
+    ("FRANÇAIS", "Artistes du soir unis.", "EUROPE", "fr"),
+    ("PIXELN", "Gemeinsam Pixel für Pixel.", "EUROPE", "de"),
+    ("日本画", "ドット絵の仲間たち！", "ASIA_PACIFIC", "ja"),
+    ("픽셀단", "함께 만드는 픽셀 아트!", "ASIA_PACIFIC", "ko"),
+    ("ARCADE", "Insert coin to paint.", "AMERICAS", "en"),
+    ("LO-FI", "Chill beats and clean pixels.", "GLOBAL", "en"),
+    ("RETRO", "16-bit nostalgia forever.", "AMERICAS", "en"),
+    ("NO VOID", "Keep the canvas bright.", "GLOBAL", "en"),
+    ("BRASIL", "Unidos pelo canvas!", "LATAM", "pt"),
+    ("MERHABA", "Renkli piksel dostları!", "EUROPE", "tr"),
 ]
 
-
 _CLEAN_SPACE_NAMES: list[tuple[str, str]] = [
-    ("Whiteout Guild", "Keep this square pure white!"),
+    ("Whiteout Guild", "Keep this space pure white!"),
     ("Blank Space", "Defend negative space!"),
     ("The Erasers", "Clean canvas forever!"),
     ("Pure Canvas", "Zero clutter, pure white!"),
@@ -142,10 +124,11 @@ _FRACTAL_NAMES: list[tuple[str, str, str]] = [
 ]
 
 _VOID_VARIANTS = ("tendrils", "black_hole", "fractal", "monster")
+_REGIONAL_TIMEZONES = ("AMERICAS", "EUROPE", "ASIA_PACIFIC", "LATAM")
 
 
 def _snap_to_walls(x0: int, y0: int, w: int, h: int, W: int, H: int, snap: int = 16) -> tuple[int, int]:
-    """Snap a territory bounding box flush against canvas walls/corners when close to an edge."""
+    """Snap a territory bounding box flush against active canvas walls/corners when close to an edge."""
     x0 = max(0, min(W - w, x0))
     y0 = max(0, min(H - h, y0))
     if x0 <= snap:
@@ -170,7 +153,7 @@ def resolve_device(spec: str) -> torch.device:
 
 
 class SimulationEngine:
-    """Thread-safe r/place engine with real-time GPU ticking, 200-faction power-law ecosystem, and async VLM/diffusion strategist."""
+    """Thread-safe r/place engine with real-time GPU ticking, 4-act canvas expansion, AI-first factions, timezones, and flash-raids."""
 
     def __init__(
         self,
@@ -182,7 +165,20 @@ class SimulationEngine:
         self.device = resolve_device(cfg.device)
         self.rng = random.Random(cfg.seed)
 
-        self.canvas = CanvasState(cfg.width, cfg.height, self.device)
+        # Act 1 starts at W/2 x H/2 with 16 initial colors when expansion is enabled
+        can_expand = cfg.enable_expansion and cfg.width >= 256 and cfg.height >= 256
+        init_w = (cfg.width // 2) if can_expand else cfg.width
+        init_h = (cfg.height // 2) if can_expand else cfg.height
+        init_tier = 1 if can_expand else 3
+
+        self.canvas = CanvasState(
+            cfg.width,
+            cfg.height,
+            self.device,
+            active_w=init_w,
+            active_h=init_h,
+            palette_tier=init_tier,
+        )
         if policy is not None:
             self.policy: PixelPolicy = policy
             self.policy_name = type(policy).__name__
@@ -217,8 +213,22 @@ class SimulationEngine:
                 )
                 self.policy_name = "stochastic"
 
+        # Align initial citizen positions and timezone clock with Act 1 active viewport
+        if hasattr(self.policy, "active_w"):
+            self.policy.active_w = init_w
+            self.policy.active_h = init_h
+            self.policy.enable_timezones = cfg.enable_timezones
+            self.policy.pos_x = self.policy.pos_x % init_w
+            self.policy.pos_y = self.policy.pos_y % init_h
+
         self.art = ArtManager(cfg, self.device)
-        self.brain = LocalVLMBrain(ollama_url=cfg.ollama_url, vlm_model=cfg.vlm_model)
+        llm_endpoint = cfg.llm_url or cfg.ollama_url
+        llm_model = cfg.llm_model or cfg.vlm_model
+        self.brain = LocalVLMBrain(
+            ollama_url=llm_endpoint,
+            vlm_model=llm_model,
+            keychain_service=cfg.keychain_service,
+        )
         self.subreddits = SubredditSampler(seed=cfg.seed)
         self.diplomacy = DiplomacyBoard()
         self.logger = EventLogger(cfg.run_dir, cfg.width, cfg.height, resume=resume)
@@ -227,6 +237,14 @@ class SimulationEngine:
         self.next_faction_id: int = 0
         self.shared_borders: list[tuple[int, int, tuple[int, int, int, int]]] = []
         self._void_cycle_idx: int = 0
+        self._idea_queue: deque[AIFactionIdea] = deque()
+        self._used_flag_keys_ever: set[str] = set()
+
+        # 4-Act progression & 72-hour virtual clock state
+        self.act: int = 1 if can_expand else 3
+        self.virtual_hour: float = 0.0
+        self._land_rush_region: tuple[int, int, int, int] | None = None
+        self._land_rush_until_tick: int = 0
 
         # Simulation runtime state
         self.tick: int = 0
@@ -238,11 +256,12 @@ class SimulationEngine:
         self.target_tps: float = cfg.target_tps
         self.actual_tps: float = 0.0
         self.pixels_per_sec: float = 0.0
-        self.brain_status: str = "Primordial chaos — citizens wandering..."
+        self.brain_status: str = "Act 1 primordial chaos — citizens arriving..."
         self.ollama_ready: bool = self.brain.check_health()
 
         self._state_lock = threading.RLock()
-        self._job_queue: queue.Queue[str] = queue.Queue(maxsize=12)
+        self._job_queue: queue.Queue[str] = queue.Queue(maxsize=16)
+        self._queued_jobs: set[str] = set()
         self._brain_busy = threading.Event()
         self._sim_thread: threading.Thread | None = None
         self._brain_thread: threading.Thread | None = None
@@ -251,13 +270,106 @@ class SimulationEngine:
             self._load_checkpoint()
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Lifecycle & 4-Act Milestone Controller
     # ------------------------------------------------------------------
+
+    def get_progress(self) -> float:
+        if self.cfg.max_hours > 0:
+            return min(1.0, max(0.0, (time.time() - self.start_wall_time) / (self.cfg.max_hours * 3600.0)))
+        return min(1.0, max(0.0, self.tick / max(1, self.cfg.max_ticks)))
 
     def is_finished(self) -> bool:
         if self.cfg.max_hours > 0:
             return (time.time() - self.start_wall_time) >= self.cfg.max_hours * 3600.0
         return self.tick >= self.cfg.max_ticks
+
+    def _prime_timezone_now(self) -> str:
+        """Return the regional timezone currently closest to its prime-time peak."""
+        h = self.virtual_hour % 24.0
+        return max(_REGIONAL_TIMEZONES, key=lambda tz: timezone_awake_factor(tz, h))
+
+    def _scatter_free_agents_into(self, x0: int, y0: int, x1: int, y1: int, frac: float = 0.35) -> None:
+        """Send a wave of free agents rushing into newly unlocked Eastern/Southern territory."""
+        free_idx = torch.nonzero(self.policy.user_factions == -1, as_tuple=False).squeeze(-1)
+        if free_idx.numel() == 0:
+            return
+        n_rush = max(1, int(free_idx.numel() * frac))
+        perm = torch.randperm(free_idx.numel(), device=self.device)[:n_rush]
+        chosen = free_idx[perm]
+        self.policy.pos_x[chosen] = torch.randint(x0, max(x0 + 1, x1), (n_rush,), dtype=torch.int32, device=self.device)
+        self.policy.pos_y[chosen] = torch.randint(y0, max(y0 + 1, y1), (n_rush,), dtype=torch.int32, device=self.device)
+
+    def _save_peak_snapshots(self) -> None:
+        """Preserve final colorful canvas snapshot right before Act 4 Whiteout begins."""
+        try:
+            self.canvas.to_pil(scale=1, active_only=False).save(self.cfg.run_dir / "final_peak.png")
+            s_2k = max(1, 2048 // max(1, self.cfg.width))
+            self.canvas.to_pil(scale=s_2k, active_only=False).save(self.cfg.run_dir / "final_peak_2k.png")
+        except Exception as exc:
+            log.warning("Could not save final_peak snapshot: %s", exc)
+
+    def _check_act_milestones(self) -> None:
+        """Drive 4-Act r/place 2022 viewport expansions, palette unlocks, and Whiteout finale."""
+        progress = self.get_progress()
+        self.virtual_hour = progress * self.cfg.virtual_hours_total
+        if hasattr(self.policy, "virtual_hour_utc"):
+            self.policy.virtual_hour_utc = self.virtual_hour % 24.0
+            self.policy.enable_timezones = self.cfg.enable_timezones
+
+        # Act 1 -> Act 2: Expand East (W x H/2), unlock 24 colors
+        if self.cfg.enable_expansion and self.act == 1 and progress >= self.cfg.act2_progress:
+            new_w, new_h = self.cfg.width, max(64, self.cfg.height // 2)
+            self.act = 2
+            self.canvas.expand_viewport(new_w, new_h, 2)
+            self._land_rush_region = (self.cfg.width // 2, 0, new_w, new_h)
+            self._land_rush_until_tick = self.tick + 700
+            self._scatter_free_agents_into(self.cfg.width // 2, 0, new_w, new_h, frac=0.40)
+            self.logger.log_chronicle(
+                self.tick,
+                "expand_canvas",
+                f"ACT 2 EXPANSION: Canvas doubled East to {new_w}x{new_h} and unlocked 24 colors! Eastern land rush begins!",
+                act=2,
+                active_w=new_w,
+                active_h=new_h,
+                palette_size=24,
+            )
+            self.queue_job("DISCOVER")
+
+        # Act 2 -> Act 3: Expand South (W x H), unlock all 32 colors
+        if self.cfg.enable_expansion and self.act == 2 and progress >= self.cfg.act3_progress:
+            new_w, new_h = self.cfg.width, self.cfg.height
+            self.act = 3
+            self.canvas.expand_viewport(new_w, new_h, 3)
+            self._land_rush_region = (0, self.cfg.height // 2, new_w, new_h)
+            self._land_rush_until_tick = self.tick + 800
+            self._scatter_free_agents_into(0, self.cfg.height // 2, new_w, new_h, frac=0.40)
+            self.logger.log_chronicle(
+                self.tick,
+                "expand_canvas",
+                f"ACT 3 EXPANSION: Canvas expanded South to full {new_w}x{new_h} with all 32 colors unlocked! Southern land rush begins!",
+                act=3,
+                active_w=new_w,
+                active_h=new_h,
+                palette_size=32,
+            )
+            self.queue_job("DISCOVER")
+
+        # Act 3 -> Act 4: Save peak colorful canvas, then lock palette to White-only finale
+        if self.cfg.enable_whiteout and self.act < 4 and progress >= self.cfg.whiteout_progress:
+            self._save_peak_snapshots()
+            self.act = 4
+            self.canvas.expand_viewport(self.cfg.width, self.cfg.height, 4)
+            self._land_rush_region = None
+            self.brain_status = "ACT 4 WHITEOUT FINALE — only white pixels remain..."
+            self.logger.log_chronicle(
+                self.tick,
+                "whiteout",
+                "ACT 4 WHITEOUT FINALE: All colors locked except pure white (#FFFFFF). The Great Whiteout sweeps the canvas!",
+                act=4,
+                active_w=self.cfg.width,
+                active_h=self.cfg.height,
+                palette_size=1,
+            )
 
     def start(self) -> None:
         self.stop_requested = False
@@ -270,11 +382,16 @@ class SimulationEngine:
         self.logger.log_chronicle(
             self.tick,
             "system",
-            f"Simulation started on {self.cfg.width}x{self.cfg.height} canvas "
-            f"({self.cfg.num_users:,} online slots, max_factions={self.cfg.max_active_factions}, "
+            f"Simulation started ({self.cfg.preset}): {self.canvas.active_w}x{self.canvas.active_h} "
+            f"-> {self.cfg.width}x{self.cfg.height} canvas, palette={len(self.canvas.allowed_colors)} colors, "
+            f"{self.cfg.num_users:,} online slots, max_factions={self.cfg.max_active_factions}, "
             f"device={self.device}, policy={self.policy_name}, horizon={horizon_str}, "
-            f"ollama={'online' if self.ollama_ready else 'fallback'}, "
-            f"subreddits={len(self.subreddits.entries):,}).",
+            f"llm={self.brain.vlm_model} ({'online' if self.ollama_ready else 'fallback'}), "
+            f"flux_art={'on' if self.cfg.use_flux_art else 'off'}.",
+            act=self.act,
+            active_w=self.canvas.active_w,
+            active_h=self.canvas.active_h,
+            palette_size=len(self.canvas.allowed_colors),
         )
         self._brain_thread = threading.Thread(target=self._strategist_loop, name="strategist", daemon=True)
         self._brain_thread.start()
@@ -290,19 +407,24 @@ class SimulationEngine:
         if self._sim_thread is not None:
             self._sim_thread.join(timeout=3.0)
         if self._brain_thread is not None:
-            self._brain_thread.join(timeout=3.0)
+            self._brain_thread.join(timeout=5.0)
         self.save_checkpoint()
         self.logger.close()
         self.brain.close()
 
     def queue_job(self, job: str) -> None:
-        try:
-            self._job_queue.put_nowait(job)
-        except queue.Full:
-            pass
+        with self._state_lock:
+            if job != "STOP" and job in self._queued_jobs:
+                return
+            try:
+                self._job_queue.put_nowait(job)
+                if job != "STOP":
+                    self._queued_jobs.add(job)
+            except queue.Full:
+                pass
 
     # ------------------------------------------------------------------
-    # Fast GPU Tick Loop
+    # Non-Blocking Fast GPU Tick Loop (REQ-SYS-006)
     # ------------------------------------------------------------------
 
     def _tick_loop(self) -> None:
@@ -316,12 +438,6 @@ class SimulationEngine:
                 t_window = time.perf_counter()
                 ticks_window = 0
                 pix_window = 0
-                continue
-
-            if (self.target_tps == 0 and (self._brain_busy.is_set() or not self._job_queue.empty())) or (
-                self._brain_busy.is_set() and not self._job_queue.empty()
-            ):
-                time.sleep(0.05)
                 continue
 
             step_start = time.perf_counter()
@@ -345,7 +461,16 @@ class SimulationEngine:
                 ticks_window = 0
                 pix_window = 0
 
-            if self.target_tps > 0:
+            if self.canvas.is_whiteout:
+                # Pace Act 4 Whiteout smoothly (~10-15k px/s) so the finale sweeps cleanly without flooding events.bin
+                elapsed = time.perf_counter() - step_start
+                min_wo_dt = max(0.55, (1.0 / self.target_tps) if self.target_tps > 0 else 0.55)
+                if elapsed < min_wo_dt:
+                    time.sleep(min_wo_dt - elapsed)
+            elif self._brain_busy.is_set() and self.device.type == "mps":
+                # Give LM Studio MLX and FLUX clean Metal queue slices without stopping GPU pixel placements
+                time.sleep(0.22)
+            elif self.target_tps > 0:
                 min_dt = 1.0 / self.target_tps
                 elapsed = time.perf_counter() - step_start
                 if elapsed < min_dt:
@@ -355,8 +480,11 @@ class SimulationEngine:
             self.brain_status = f"Finished at tick {self.tick} ({self.logger.total_events:,} pixels)!"
             self.save_checkpoint()
             try:
-                self.canvas.to_pil(scale=1).save(self.cfg.run_dir / "final.png")
-                self.canvas.to_pil(scale=4).save(self.cfg.run_dir / "final_2k.png")
+                self.canvas.to_pil(scale=1, active_only=False).save(self.cfg.run_dir / "final.png")
+                s_2k = max(1, 2048 // max(1, self.cfg.width))
+                self.canvas.to_pil(scale=s_2k, active_only=False).save(self.cfg.run_dir / "final_2k.png")
+                if not (self.cfg.run_dir / "final_peak.png").exists():
+                    self._save_peak_snapshots()
             except Exception:
                 pass
             pop = self.policy.get_population_stats() if hasattr(self.policy, "get_population_stats") else {}
@@ -372,6 +500,7 @@ class SimulationEngine:
         with self._state_lock:
             self.tick += 1
             tick = self.tick
+            self._check_act_milestones()
             self.canvas.decay_activity(0.94)
 
             batch = self.policy.step(tick, self.canvas, self.factions, self.shared_borders)
@@ -387,33 +516,54 @@ class SimulationEngine:
                     batch.user_ids.detach().cpu().numpy(),
                 )
 
-            if tick % 15 == 0:
-                update_faction_metrics(self.canvas, self.factions, self.policy.user_factions)
-                self.policy.social_step(self.factions, self.canvas)
-                self._refresh_shared_borders()
+            if not self.canvas.is_whiteout:
+                if tick % 20 == 0:
+                    update_faction_metrics(self.canvas, self.factions, self.policy.user_factions)
+                    self.policy.social_step(self.factions, self.canvas)
+                    self._refresh_shared_borders()
+                    self._manage_flash_raids()
 
-            # Advance progressive Transverse Ribbons cleanly every 65 ticks
-            if tick >= self.cfg.chaos_ticks + 65 and tick % 65 == 0:
-                self._advance_ribbons()
+                if tick >= self.cfg.chaos_ticks + 65 and tick % 65 == 0:
+                    self._advance_ribbons()
 
-            if (
-                tick >= self.cfg.chaos_ticks
-                and (tick - self.cfg.chaos_ticks) % self.cfg.discovery_interval == 0
-            ):
-                self.queue_job("DISCOVER")
+                if (
+                    tick >= self.cfg.chaos_ticks
+                    and (tick - self.cfg.chaos_ticks) % self.cfg.discovery_interval == 0
+                ):
+                    self.queue_job("DISCOVER")
 
-            if (
-                tick >= self.cfg.chaos_ticks + 40
-                and (tick - self.cfg.chaos_ticks - 40) % self.cfg.epoch_interval == 0
-            ):
-                self.queue_job("EPOCH")
+                if (
+                    tick >= self.cfg.chaos_ticks + 40
+                    and (tick - self.cfg.chaos_ticks - 40) % self.cfg.epoch_interval == 0
+                ):
+                    self.queue_job("EPOCH")
+
+                if (
+                    self.cfg.enable_flash_raids
+                    and tick >= self.cfg.chaos_ticks + 220
+                    and (tick - self.cfg.chaos_ticks) % self.cfg.flash_raid_interval_ticks == 0
+                ):
+                    self.queue_job("FLASH_RAID")
 
             if tick % self.cfg.checkpoint_interval == 0:
                 self.save_checkpoint()
-                if self.device.type == "mps":
-                    torch.mps.empty_cache()
+            if tick % 100 == 0 and self.device.type == "mps":
+                torch.mps.empty_cache()
 
         return n_placed
+
+    def _manage_flash_raids(self) -> None:
+        """Disperse temporary streamer flash-raid mobs once their blitz timer expires."""
+        for f in self.factions:
+            if f.alive and f.is_streamer_raid and f.raid_end_tick > 0 and self.tick >= f.raid_end_tick:
+                f.alive = False
+                self.policy.release_faction_members(f.id)
+                self.logger.log_chronicle(
+                    self.tick,
+                    "raid",
+                    f"RAID DISPERSED: Streamer mob '{f.name}' wrapped up its blitz ({f.timezone_region}), leaving its mark on the canvas!",
+                    faction_id=f.id,
+                )
 
     def _refresh_shared_borders(self) -> None:
         borders: list[tuple[int, int, tuple[int, int, int, int]]] = []
@@ -437,19 +587,20 @@ class SimulationEngine:
     # ------------------------------------------------------------------
 
     def _advance_ribbons(self) -> None:
-        """Advance each active Transverse Ribbon step-by-step across the Canvas, respecting ally tunnels."""
-        W, H = self.cfg.width, self.cfg.height
+        """Advance each active Transverse Ribbon step-by-step across the active viewport, respecting ally tunnels."""
+        W, H = self.canvas.active_w, self.canvas.active_h
+        allowed = self.canvas.allowed_colors
         fac_by_id = {f.id: f for f in self.factions if f.alive}
+        step = max(52, W // 12)
 
         for fac in self.factions:
             if not (fac.alive and fac.art_mode == "ribbon"):
                 continue
-            if fac.integrity < 0.35:
+            if fac.integrity < 0.30:
                 continue
 
-            step = 52
             axis = fac.ribbon_axis or "h"
-            thick = max(5, min(15, fac.ribbon_thickness))
+            thick = max(6, min(18, fac.ribbon_thickness))
             nx0, ny0, nw, nh = fac.x0, fac.y0, fac.w, fac.h
 
             if axis == "h":
@@ -497,10 +648,10 @@ class SimulationEngine:
                 length=max(nw, nh),
                 thickness=thick,
             )
-            # Clip cleanly to canvas
             bp_np = bp_np[: min(bp_np.shape[0], H - ny0), : min(bp_np.shape[1], W - nx0)]
+            bp_np = remap_indices_to_allowed(bp_np, allowed)
 
-            # Respect allied Factions by leaving transparent overpass tunnels over allies
+            # Leave transparent overpass tunnels over allied factions
             for ally_id in fac.allies:
                 ally = fac_by_id.get(ally_id)
                 if ally is None or ally.is_void:
@@ -514,10 +665,10 @@ class SimulationEngine:
 
             fac.set_blueprint(bp_np, x0=nx0, y0=ny0, device=self.device)
             if (axis == "h" and fac.w >= W) or (axis == "v" and fac.h >= H):
-                fac.remember("Spanned all 512px across the entire Canvas!")
+                fac.remember(f"Spanned across the entire {W}x{H} viewport!")
 
     # ------------------------------------------------------------------
-    # Async VLM + Multi-Scale Strategist Worker
+    # Async VLM + FLUX Strategist Worker
     # ------------------------------------------------------------------
 
     def _strategist_loop(self) -> None:
@@ -526,14 +677,20 @@ class SimulationEngine:
                 job = self._job_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            with self._state_lock:
+                self._queued_jobs.discard(job)
             if job == "STOP":
                 break
+            if self.canvas.is_whiteout and job != "STOP":
+                continue
             self._brain_busy.set()
             try:
                 if job == "DISCOVER":
                     self.run_pareidolia_discovery()
                 elif job == "EPOCH":
                     self.run_geopolitical_epoch()
+                elif job == "FLASH_RAID":
+                    self.spawn_streamer_flash_raid()
                 elif job == "VOID":
                     self.spawn_void_eruption(force=True)
             except Exception as exc:
@@ -543,14 +700,13 @@ class SimulationEngine:
                 self._brain_busy.clear()
 
     def _pick_next_tier(self, alive_art: list[Faction]) -> str:
-        """Choose next size tier to track empirical placeAtlas shares (60% micro, 24% med, 12% macro, 4% ribbon)."""
+        """Choose next size tier to track empirical placeAtlas power-law shares."""
         n = len(alive_art)
-        # Seed initial iconic structure fast: corner macros + early ribbon + medium/micro
         if n < 2:
             return "macro"
         if n == 2:
             return "ribbon"
-        if n < 5:
+        if n < 6:
             return "medium"
         counts = Counter(f.size_tier for f in alive_art)
         best_tier = "micro"
@@ -564,52 +720,75 @@ class SimulationEngine:
                 best_tier = tier
         return best_tier
 
-    def _pick_category_for_tier(self, tier: str) -> str:
-        """Sample artwork category emphasizing comic strips, cartoons, memes, and text logos with restrained flags."""
-        r = self.rng.random()
-        if tier == "ribbon":
-            return "ribbon"
-        if tier == "macro":
-            if r < 0.28:
-                return "comic_strip"
-            if r < 0.52:
-                return "banner"
-            if r < 0.76:
-                return "cartoon_meme"
-            if r < 0.86:
-                return "flag"
-            if r < 0.94:
-                return "diffusion"
-            return "painting" if self.rng.random() < 0.5 else ("procedural" if self.rng.random() < 0.6 else "fractal")
-        if tier == "medium":
-            if r < 0.26:
-                return "cartoon_meme"
-            if r < 0.50:
-                return "comic_strip"
-            if r < 0.72:
-                return "banner"
-            if r < 0.82:
-                return "flag"
-            if r < 0.90:
-                return "diffusion"
-            if r < 0.95:
-                return "painting"
-            return "fractal" if self.rng.random() < 0.5 else "clean_space"
-        # micro tier (~60% of active factions)
-        if r < 0.52:
-            return "micro_sprite"
-        if r < 0.72:
-            return "banner"
-        if r < 0.84:
-            return "cartoon_meme"
-        if r < 0.91:
-            return "flag"
-        if r < 0.96:
-            return "clean_space"
-        return "painting" if self.rng.random() < 0.5 else "fractal"
+    def _size_scale(self) -> float:
+        """Scale art dimensions cleanly between 512px, 1024px, and 2000px canvases."""
+        if self.cfg.width >= 1800:
+            return 1.38
+        if self.cfg.width >= 960:
+            return 1.15
+        return 1.0
+
+    def _dims_for_tier(self, tier: str, art_mode: str, aspect: str = "square") -> tuple[int, int]:
+        s = self._size_scale()
+        if tier == "micro":
+            if art_mode == "flag":
+                w, h = self.rng.choice([(22, 14), (26, 16), (28, 18)])
+            elif art_mode == "banner":
+                w, h = self.rng.choice([(32, 14), (36, 16), (38, 16)])
+            elif art_mode == "clean_space":
+                w, h = self.rng.choice([(20, 18), (24, 20)])
+            elif aspect == "wide":
+                w, h = self.rng.choice([(32, 22), (36, 24)])
+            elif aspect == "tall":
+                w, h = self.rng.choice([(22, 30), (24, 34)])
+            else:
+                d = self.rng.choice([20, 24, 26, 28, 30])
+                w, h = d, d
+        elif tier == "medium":
+            if art_mode == "flag":
+                w, h = self.rng.choice([(44, 28), (50, 32), (56, 36)])
+            elif art_mode == "flux_comic":
+                w, h = self.rng.choice([(82, 36), (92, 40)])
+            elif art_mode == "banner":
+                w, h = self.rng.choice([(66, 24), (76, 28), (84, 30)])
+            elif art_mode == "clean_space":
+                w, h = self.rng.choice([(34, 28), (38, 30)])
+            elif aspect == "wide":
+                w, h = self.rng.choice([(62, 42), (68, 44)])
+            elif aspect == "tall":
+                w, h = self.rng.choice([(40, 56), (44, 62)])
+            else:
+                d = self.rng.choice([42, 46, 52, 56])
+                w, h = d, d
+        else:  # macro
+            if art_mode == "flag":
+                w, h = self.rng.choice([(72, 46), (82, 52), (90, 56)])
+            elif art_mode == "flux_comic":
+                w, h = self.rng.choice([(104, 44), (116, 48), (124, 52)])
+            elif art_mode == "banner":
+                w, h = self.rng.choice([(98, 34), (114, 38), (128, 44)])
+            elif aspect == "wide":
+                w, h = self.rng.choice([(96, 62), (108, 68)])
+            elif aspect == "tall":
+                w, h = self.rng.choice([(64, 92), (72, 102)])
+            else:
+                d = self.rng.choice([68, 76, 84, 92])
+                w, h = d, d
+
+        max_w = max(24, self.canvas.active_w // 4)
+        max_h = max(24, self.canvas.active_h // 4)
+        return min(max_w, int(round(w * s))), min(max_h, int(round(h * s)))
 
     def _target_initial_members(self, tier: str, valid_pixels: int) -> int:
-        """Scale initial citizen recruitment proportionally to Blueprint area (REQ-SIM-011)."""
+        """Scale initial citizen recruitment proportionally to Blueprint area & total slots."""
+        if self.cfg.max_active_factions >= 500:
+            if tier == "micro":
+                return max(36, min(95, int(30 + valid_pixels * 0.08)))
+            if tier == "medium":
+                return max(105, min(240, int(90 + valid_pixels * 0.05)))
+            if tier == "ribbon":
+                return self.rng.randint(320, 520)
+            return max(260, min(580, int(200 + valid_pixels * 0.04)))
         if tier == "micro":
             return max(42, min(125, int(38 + valid_pixels * 0.16)))
         if tier == "medium":
@@ -628,29 +807,28 @@ class SimulationEngine:
         is_micro: bool = False,
         allow_flux: bool = False,
     ) -> TypographyStyleSpec:
-        """Varied multi-font typography spec for micro/medium/macro text logos."""
+        """Varied multi-font multilingual typography spec for floating pixel wordmarks."""
+        has_non_ascii = any(ord(ch) > 127 for ch in text)
         font = FONT_STYLES[f_idx % len(FONT_STYLES)]
         ce = ("vertical_gradient", "per_letter_palette", "glossy_highlight", "rainbow_letters", "striped_fill", "solid")[f_idx % 6]
         be = ("extrude_3d", "double_sticker", "neon_glow", "drop_shadow", "outline_1px")[(f_idx // 2) % 5]
-        lay = ("wavy", "arched", "straight", "italic_slant")[(f_idx // 3) % 4]
-        use_rib = (not is_micro) and (f_idx % 3 == 0)
-        if is_micro:
+        lay = ("straight", "wavy", "arched", "italic_slant")[(f_idx // 3) % 4]
+        use_rib = (not is_micro) and (not has_non_ascii) and (f_idx % 4 == 0)
+        if is_micro or has_non_ascii:
             engine_choice = "styled"
         elif allow_flux and f_idx % 3 == 0:
             engine_choice = "flux"
-        elif f_idx % 3 == 1:
-            engine_choice = "code"
         else:
             engine_choice = "styled"
         return TypographyStyleSpec(
             include_text=True,
-            text=text[:12],
-            casing="subreddit" if text.lower().startswith("r/") else ("upper" if f_idx % 2 == 0 else "title"),
+            text=text[:14],
+            casing="subreddit" if text.lower().startswith("r/") else ("upper" if (not has_non_ascii and f_idx % 2 == 0) else "title"),
             font_style=font,
             size_tier="tiny" if is_micro else "large",
             color_effect=ce,  # type: ignore[arg-type]
             border_effect="outline_1px" if is_micro else be,  # type: ignore[arg-type]
-            layout="straight" if is_micro else lay,  # type: ignore[arg-type]
+            layout="straight" if (is_micro or has_non_ascii) else lay,  # type: ignore[arg-type]
             placement="center",
             fill_color=primary if primary != BLACK_IDX else YELLOW_IDX,
             fill_color_2=secondary if secondary != primary else accent,
@@ -662,221 +840,204 @@ class SimulationEngine:
             engine=engine_choice,  # type: ignore[arg-type]
         )
 
-    def run_pareidolia_discovery(self, max_new: int = 6) -> list[Faction]:
-        """Multi-scale discovery wave spawning up to 6 factions across Macro/Medium/Micro/Ribbon tiers."""
+    def _refill_ai_idea_queue(
+        self, existing_names: list[str], allowed_colors: tuple[int, ...]
+    ) -> None:
+        """Ask local Qwen3-VL-30B to invent a batch of 10 unique multilingual/pop-culture/comic/geometric factions."""
+        if not self.ollama_ready:
+            return
+        prime_tz = self._prime_timezone_now()
+        sub_hints = [self.subreddits.sample(size_tier="medium").name for _ in range(6)]
+        self.brain_status = f"Act {self.act} (Hr {self.virtual_hour:.1f}) — Qwen3-VL brainstorming fresh communities ({prime_tz})..."
+        batch = self.brain.brainstorm_faction_batch(
+            count=8,
+            act=self.act,
+            virtual_hour=self.virtual_hour,
+            prime_tz=prime_tz,
+            unlocked_colors=allowed_colors,
+            existing_names=existing_names,
+            subreddit_hints=sub_hints,
+        )
+        if batch:
+            for idea in batch:
+                self._idea_queue.append(idea)
+            log.info("Brainstormed %d original AI faction ideas (queue=%d)", len(batch), len(self._idea_queue))
+
+    def _pick_spawn_slot(
+        self,
+        tier: str,
+        bp_w: int,
+        bp_h: int,
+        allow_cameo: bool,
+        def_c1: int,
+        def_c2: int,
+    ) -> tuple[int, int, bool, bool, bool, Any, np.ndarray, list[str]]:
+        """Locate an open or emergent pareidolia bounding box inside the active viewport."""
+        prefer_region = (
+            self._land_rush_region
+            if (self._land_rush_region is not None and self.tick <= self._land_rush_until_tick)
+            else None
+        )
+        scan_win = min(max(bp_w, bp_h), 72)
+        scan_stride = max(12, min(48, self.canvas.active_w // 28))
+        with self._state_lock:
+            W_act, H_act = self.canvas.active_w, self.canvas.active_h
+            cands = find_pareidolia_candidates(
+                self.canvas,
+                self.factions,
+                window=scan_win,
+                stride=scan_stride,
+                min_density=0.04 if tier != "micro" else 0.01,
+                top_k=1,
+                allow_cameo=allow_cameo,
+                rng=self.rng,
+                prefer_region=prefer_region,
+            )
+            if not cands:
+                x0, y0 = find_open_exodus_spot(
+                    self.canvas, self.factions, bp_w, bp_h, prefer_region=prefer_region
+                )
+                is_cameo = is_corner = is_edge = False
+                dom_colors = [def_c1, def_c2]
+                crop_pil = self.canvas.crop_pil(x0, y0, x0 + bp_w, y0 + bp_h, scale=4)
+                crop_rgb = self.canvas.crop_rgb_numpy(x0, y0, x0 + bp_w, y0 + bp_h)
+            else:
+                c = cands[0]
+                is_cameo = c.is_cameo
+                is_corner = c.is_corner
+                is_edge = c.is_edge
+                dom_colors = c.dominant_colors
+                raw_x0 = c.x0 - (bp_w - c.w) // 2
+                raw_y0 = c.y0 - (bp_h - c.h) // 2
+                if is_cameo:
+                    x0 = max(0, min(W_act - bp_w, raw_x0))
+                    y0 = max(0, min(H_act - bp_h, raw_y0))
+                else:
+                    x0, y0 = _snap_to_walls(
+                        raw_x0, raw_y0, bp_w, bp_h, W_act, H_act, snap=14 if tier != "micro" else 6
+                    )
+                crop_pil = self.canvas.crop_pil(c.x0, c.y0, c.x0 + c.w, c.y0 + c.h, scale=4)
+                crop_rgb = self.canvas.crop_rgb_numpy(c.x0, c.y0, c.x0 + c.w, c.y0 + c.h)
+            dom_names = [COLOR_NAMES[idx] for idx in dom_colors if 0 <= idx < len(COLOR_NAMES)]
+        return x0, y0, is_cameo, is_corner, is_edge, crop_pil, crop_rgb, dom_names
+
+    def run_pareidolia_discovery(self, max_new: int = 4) -> list[Faction]:
+        """AI-first multi-scale discovery wave (>= 80% live AI-invented factions + restrained flags/ribbons/cameos)."""
+        if self.canvas.is_whiteout:
+            return []
+
         with self._state_lock:
             alive_art = [f for f in self.factions if f.alive and not f.is_void]
-            slots = self.cfg.max_active_factions - len(alive_art)
+            area_frac = (self.canvas.active_w * self.canvas.active_h) / max(1, self.cfg.width * self.cfg.height)
+            if area_frac < 0.99:
+                eff_max_factions = max(24, int(round(self.cfg.max_active_factions * min(1.0, area_frac + 0.08))))
+            else:
+                eff_max_factions = self.cfg.max_active_factions
+            slots = eff_max_factions - len(alive_art)
             if slots <= 0:
                 return []
-            # Fill early canvas briskly (up to 6 per wave), then gently replace fallen factions
             wave_size = min(max_new, slots)
             existing_names = {f.name.lower() for f in self.factions}
             existing_names_list = [f.name for f in self.factions]
             existing_themes_list = [f.theme for f in self.factions]
-            existing_flag_keys = {f.extra_key for f in alive_art if f.category == "flag"}
-            existing_paint_keys = {f.extra_key for f in alive_art if f.category == "painting"}
-            existing_comic_keys = {f.extra_key for f in alive_art if f.art_mode == "comic_strip"}
-            existing_meme_keys = {f.extra_key for f in alive_art if f.art_mode == "cartoon_meme"}
-            existing_rib_keys = {f.extra_key for f in alive_art if f.art_mode == "ribbon"}
+            active_flag_keys = {f.extra_key for f in alive_art if f.category == "flag"}
+            active_rib_keys = {f.extra_key for f in alive_art if f.art_mode == "ribbon"}
+            active_comic_keys = {f.extra_key for f in alive_art if f.art_mode == "comic_strip"}
+            active_meme_keys = {f.extra_key for f in alive_art if f.art_mode == "cartoon_meme"}
+            active_sprite_keys = {f.extra_key for f in alive_art if f.art_mode == "micro_sprite"}
             tick = self.tick
             total_founded = len(self.factions)
+            allowed_colors = self.canvas.allowed_colors
+
+        # Keep AI idea queue primed from Qwen3-VL-30B (non-blocking, outside lock)
+        if self.ollama_ready and len(self._idea_queue) < wave_size + 2:
+            self._refill_ai_idea_queue(existing_names_list, allowed_colors)
 
         created: list[Faction] = []
-        vlm_calls_in_wave = 0
+        flux_calls_in_wave = 0
+        max_flux_per_wave = 2 if self.cfg.use_flux_art else 0
         sim_alive = list(alive_art)
 
         for i in range(wave_size):
-            if self.stop_requested:
+            if self.stop_requested or self.canvas.is_whiteout:
                 break
 
             tier = self._pick_next_tier(sim_alive)
-            cat_choice = self._pick_category_for_tier(tier)
             f_idx = total_founded + i
             theme_desc, def_c1_name, def_c2_name, def_c3_name = COLOR_THEMES[f_idx % len(COLOR_THEMES)]
             def_c1 = resolve_color(def_c1_name, BLUE_IDX)
             def_c2 = resolve_color(def_c2_name, YELLOW_IDX)
             def_c3 = resolve_color(def_c3_name, WHITE_IDX)
 
-            # Cap total active flags (<= 18 overall, <= 3 macro) so flags stay balanced
+            # Decide world primitive vs AI-invented faction (~84%+ live AI-invented!)
             alive_flags = sum(1 for f in sim_alive if f.category == "flag")
-            alive_macro_flags = sum(1 for f in sim_alive if f.category == "flag" and f.size_tier == "macro")
-            if cat_choice == "flag" and (alive_flags >= 18 or (tier == "macro" and alive_macro_flags >= 3)):
-                if tier == "micro":
-                    cat_choice = "micro_sprite" if self.rng.random() < 0.65 else "banner"
-                else:
-                    cat_choice = self.rng.choice(["comic_strip", "cartoon_meme", "banner"])
+            alive_ribbons = sum(1 for f in sim_alive if f.art_mode == "ribbon")
+            max_flags = min(len(NATIONAL_FLAGS), max(12, int(self.cfg.max_active_factions * 0.09)))
+            max_ribbons = 8 if self.cfg.width >= 1800 else 4
 
-            # Cap VLM+diffusion spawns to <= 2 per wave without falling back to flags
-            fast_banner_override = False
-            if cat_choice == "diffusion" and tier != "micro" and vlm_calls_in_wave >= 2:
-                cat_choice = "comic_strip" if self.rng.random() < 0.5 else "cartoon_meme"
-            elif cat_choice == "banner" and tier != "micro" and vlm_calls_in_wave >= 1:
-                fast_banner_override = True
+            r = self.rng.random()
+            if tier == "ribbon" and alive_ribbons < max_ribbons:
+                spawn_kind = "ribbon"
+            elif alive_flags < max_flags and r < 0.095:
+                spawn_kind = "flag"
+            elif tier == "micro" and r < 0.115:
+                spawn_kind = "amogus_cameo"
+            elif tier in ("micro", "medium") and r < 0.132:
+                spawn_kind = "clean_space"
+            else:
+                spawn_kind = "ai_invented"
+                if tier == "ribbon":
+                    tier = "medium"
 
-            # Pre-select comic / cartoon-meme spec so bounding box matches layout aspect ratio
-            pre_comic = None
-            pre_meme = None
-            if cat_choice == "comic_strip":
-                avail_c = [c for c in COMIC_CATALOG if c.key not in existing_comic_keys] or COMIC_CATALOG
-                pre_comic = self.rng.choice(avail_c)
-            elif cat_choice == "cartoon_meme":
-                avail_m = [m for m in CARTOON_MEME_CATALOG if m.key not in existing_meme_keys] or CARTOON_MEME_CATALOG
-                pre_meme = self.rng.choice(avail_m)
-
-            # --- 1. Determine candidate bounding box & dimensions ---
+            # Defaults
             is_cameo = False
-            is_corner = False
-            is_edge = False
-            cand_crop_pil = None
-            cand_crop_rgb = None
-            dom_names: list[str] = []
+            extra_key = ""
             ribbon_axis = ""
             ribbon_thick = 8
-            extra_key = ""
+            typo_spec: TypographyStyleSpec | None = None
+            flux_style_desc = ""
+            fluid_cutout = True
+            ai_code_str = ""
+            ai_origin = False
+            tz_region = "GLOBAL"
+            lang_code = "en"
+            cand_crop_rgb: np.ndarray | None = None
+            sub_entry = self.subreddits.sample(size_tier=tier, avoid_names=existing_names)
+            sub_name = sub_entry.name
 
-            if tier == "ribbon":
+            if spawn_kind == "ribbon":
                 axis_r = self.rng.random()
                 ribbon_axis = "h" if axis_r < 0.55 else ("v" if axis_r < 0.85 else self.rng.choice(["d1", "d2"]))
-                ribbon_thick = self.rng.choice([6, 7, 8, 9, 10, 12])
+                ribbon_thick = self.rng.choice([7, 8, 10, 12]) if self.cfg.width >= 1500 else self.rng.choice([6, 7, 8, 10])
                 with self._state_lock:
                     x0, y0, bp_w, bp_h = find_ribbon_track(self.canvas, self.factions, ribbon_axis, ribbon_thick, self.rng)
-                avail_ribs = [p for p in RIBBON_PATTERNS if p[0] not in existing_rib_keys] or RIBBON_PATTERNS
+                avail_ribs = [p for p in RIBBON_PATTERNS if p[0] not in active_rib_keys] or RIBBON_PATTERNS
                 pkey, pname, pcols, _ = self.rng.choice(avail_ribs)
-                existing_rib_keys.add(pkey)
+                active_rib_keys.add(pkey)
                 extra_key = f"{pkey}|{ribbon_thick}" if ribbon_axis in ("d1", "d2") else pkey
                 fac_name = pname if pname.lower() not in existing_names else f"{pname} {f_idx + 1}"
                 fac_theme = f"cross-map {pkey} ribbon"
-                fac_slogan = f"Extend the {pname} across all 512px!"
+                fac_slogan = f"Extend the {pname} across the canvas!"
                 art_mode = "ribbon"
                 fac_category = "ribbon"
                 art_prompt = f"straight {ribbon_axis} {pkey} patterned ribbon"
                 c1, c2, c3 = pcols[0], pcols[min(1, len(pcols) - 1)], pcols[-1]
                 sub_name = f"place_{pkey}"
-                typo_spec = None
-                flux_style_desc = ""
 
-            else:
-                # Choose target Blueprint dimensions strictly within tier bounds (REQ-SIM-010)
-                if tier == "micro":
-                    if cat_choice == "flag":
-                        bp_w, bp_h = self.rng.choice([(20, 13), (22, 14), (24, 15)])
-                    elif cat_choice == "painting":
-                        bp_w, bp_h = self.rng.choice([(24, 20), (26, 22), (28, 22)])
-                    elif cat_choice == "banner":
-                        bp_w, bp_h = self.rng.choice([(28, 12), (32, 14), (30, 14)])
-                    elif cat_choice == "cartoon_meme":
-                        if pre_meme is not None and pre_meme.key == "nyan_cat":
-                            bp_w, bp_h = 30, 20
-                        else:
-                            bp_w, bp_h = self.rng.choice([(24, 24), (26, 26), (28, 28)])
-                    elif cat_choice == "clean_space":
-                        bp_w, bp_h = self.rng.choice([(18, 18), (22, 18), (24, 20)])
-                    else:
-                        s = self.rng.choice([16, 18, 20, 22, 24, 26])
-                        bp_w, bp_h = s, s
-                    scan_win, scan_stride = max(bp_w, bp_h), 10
-                    allow_cameo = (cat_choice in ("micro_sprite", "banner")) and (len(sim_alive) >= 28) and (self.rng.random() < 0.25)
-                elif tier == "medium":
-                    if cat_choice == "flag":
-                        bp_w, bp_h = self.rng.choice([(38, 24), (42, 28), (46, 30)])
-                    elif cat_choice == "comic_strip":
-                        if pre_comic is not None and pre_comic.layout == "3h":
-                            bp_w, bp_h = self.rng.choice([(64, 28), (72, 30)])
-                        elif pre_comic is not None and pre_comic.layout == "2v":
-                            bp_w, bp_h = self.rng.choice([(48, 38), (54, 42)])
-                        else:
-                            bp_w, bp_h = self.rng.choice([(50, 42), (56, 46)])
-                    elif cat_choice == "cartoon_meme":
-                        if pre_meme is not None and pre_meme.key == "nyan_cat":
-                            bp_w, bp_h = self.rng.choice([(52, 34), (58, 36)])
-                        else:
-                            bp_w, bp_h = self.rng.choice([(38, 38), (44, 44), (48, 48)])
-                    elif cat_choice == "painting":
-                        bp_w, bp_h = self.rng.choice([(36, 28), (42, 34), (48, 38)])
-                    elif cat_choice == "banner":
-                        bp_w, bp_h = self.rng.choice([(60, 24), (70, 26), (78, 30)])
-                    elif cat_choice == "clean_space":
-                        bp_w, bp_h = self.rng.choice([(32, 26), (36, 28)])
-                    else:
-                        s = self.rng.choice([36, 42, 48, 52])
-                        bp_w, bp_h = s, s
-                    scan_win, scan_stride = min(54, max(bp_w, bp_h)), 18
-                    allow_cameo = False
-                else:  # macro
-                    if cat_choice == "flag":
-                        bp_w, bp_h = self.rng.choice([(64, 40), (72, 46), (78, 48)])
-                    elif cat_choice == "comic_strip":
-                        if pre_comic is not None and pre_comic.layout == "3h":
-                            bp_w, bp_h = self.rng.choice([(84, 34), (94, 36), (102, 40)])
-                        elif pre_comic is not None and pre_comic.layout == "2v":
-                            bp_w, bp_h = self.rng.choice([(60, 48), (68, 54)])
-                        else:
-                            bp_w, bp_h = self.rng.choice([(62, 52), (70, 58)])
-                    elif cat_choice == "cartoon_meme":
-                        if pre_meme is not None and pre_meme.key == "nyan_cat":
-                            bp_w, bp_h = self.rng.choice([(68, 42), (76, 46)])
-                        else:
-                            bp_w, bp_h = self.rng.choice([(52, 52), (58, 58), (64, 64)])
-                    elif cat_choice == "painting":
-                        bp_w, bp_h = self.rng.choice([(54, 42), (62, 48), (68, 54)])
-                    elif cat_choice == "banner":
-                        bp_w, bp_h = self.rng.choice([(96, 34), (110, 38), (124, 42)])
-                    else:
-                        s = self.rng.choice([60, 68, 74])
-                        bp_w, bp_h = s, s
-                    scan_win, scan_stride = min(68, max(bp_w, bp_h)), 24
-                    allow_cameo = False
-
-                with self._state_lock:
-                    cands = find_pareidolia_candidates(
-                        self.canvas,
-                        self.factions,
-                        window=scan_win,
-                        stride=scan_stride,
-                        min_density=0.06 if tier != "micro" else 0.01,
-                        top_k=1,
-                        allow_cameo=allow_cameo,
-                        rng=self.rng,
-                    )
-                    if not cands:
-                        # Fallback to least-occupied spot for dense packing
-                        fx0, fy0 = find_open_exodus_spot(self.canvas, self.factions, bp_w, bp_h)
-                        x0, y0 = fx0, fy0
-                        dom_colors = [def_c1, def_c2]
-                        cand_crop_pil = self.canvas.crop_pil(x0, y0, x0 + bp_w, y0 + bp_h, scale=6)
-                        cand_crop_rgb = self.canvas.crop_rgb_numpy(x0, y0, x0 + bp_w, y0 + bp_h)
-                    else:
-                        c = cands[0]
-                        is_cameo = c.is_cameo
-                        is_corner = c.is_corner
-                        is_edge = c.is_edge
-                        dom_colors = c.dominant_colors
-                        raw_x0 = c.x0 - (bp_w - c.w) // 2
-                        raw_y0 = c.y0 - (bp_h - c.h) // 2
-                        if is_cameo:
-                            x0 = max(0, min(self.cfg.width - bp_w, raw_x0))
-                            y0 = max(0, min(self.cfg.height - bp_h, raw_y0))
-                        else:
-                            x0, y0 = _snap_to_walls(
-                                raw_x0, raw_y0, bp_w, bp_h, self.cfg.width, self.cfg.height,
-                                snap=14 if tier != "micro" else 6,
-                            )
-                        cand_crop_pil = self.canvas.crop_pil(c.x0, c.y0, c.x0 + c.w, c.y0 + c.h, scale=6)
-                        cand_crop_rgb = self.canvas.crop_rgb_numpy(c.x0, c.y0, c.x0 + c.w, c.y0 + c.h)
-                    dom_names = [COLOR_NAMES[idx] for idx in dom_colors if 0 <= idx < len(COLOR_NAMES)]
-
-                # --- 2. Build metadata & art spec for the selected category ---
-                sub_entry = self.subreddits.sample(size_tier=tier, avoid_names=existing_names)
-                sub_name = sub_entry.name
-                typo_spec = None
-                flux_style_desc = ""
-
-                if cat_choice == "flag":
-                    avail_flags = [fl for fl in NATIONAL_FLAGS if fl.key not in existing_flag_keys] or NATIONAL_FLAGS
+            elif spawn_kind == "flag":
+                # Strict <= 1 active copy per country, preferring countries never spawned yet
+                unused_ever = [fl for fl in NATIONAL_FLAGS if fl.key not in active_flag_keys and fl.key not in self._used_flag_keys_ever]
+                avail_flags = unused_ever or [fl for fl in NATIONAL_FLAGS if fl.key not in active_flag_keys]
+                if not avail_flags:
+                    spawn_kind = "ai_invented"
+                else:
                     fl = self.rng.choice(avail_flags)
-                    existing_flag_keys.add(fl.key)
+                    active_flag_keys.add(fl.key)
+                    self._used_flag_keys_ever.add(fl.key)
                     extra_key = fl.key
+                    tz_region = FLAG_TIMEZONES.get(fl.key, "GLOBAL")
+                    bp_w, bp_h = self._dims_for_tier(tier, "flag", aspect="wide")
+                    x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, fl.primary, fl.secondary)
                     fac_name = fl.display_name if fl.display_name.lower() not in existing_names else f"{fl.display_name} {f_idx + 1}"
                     fac_theme = f"{fl.key} national flag"
                     fac_slogan = fl.slogan
@@ -885,178 +1046,232 @@ class SimulationEngine:
                     art_prompt = f"{fl.key} national flag"
                     c1, c2, c3 = fl.primary, fl.secondary, fl.accent
                     sub_name = fl.subreddit
+                    fluid_cutout = False
 
-                elif cat_choice == "micro_sprite":
-                    skey = self.rng.choice(SPRITE_KEYS)
-                    extra_key = skey
-                    from pixel_battle.art.sprites import SPRITE_BY_KEY
+            if spawn_kind == "amogus_cameo":
+                # Subtle hidden 10x12 Among Us crewmate cameo tucked onto the canvas
+                bp_w, bp_h = self.rng.choice([(10, 12), (12, 14)])
+                x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(
+                    "micro", bp_w, bp_h, allow_cameo=(len(sim_alive) >= 12), def_c1=def_c1, def_c2=def_c2
+                )
+                extra_key = "amogus"
+                fac_name = f"Sus Crew #{f_idx + 1}"
+                fac_theme = "hidden mini crewmate cameo"
+                fac_slogan = "shhh... blend into the background!"
+                art_mode = "micro_sprite"
+                fac_category = "meme"
+                art_prompt = "tiny hidden pixel crewmate"
+                c1, c2, c3 = def_c1, def_c2, WHITE_IDX
+                sub_name = "AmongUs"
+                tier = "micro"
 
-                    tmpl = SPRITE_BY_KEY[skey]
-                    label_sub = f"r/{sub_name[:12]}"
-                    fac_name = label_sub if label_sub.lower() not in existing_names else f"{tmpl.title} {f_idx + 1}"
-                    fac_theme = f"{tmpl.title} ({tmpl.category})"
-                    fac_slogan = f"{label_sub} holds these pixels!"
-                    art_mode = "micro_sprite"
-                    fac_category = tmpl.category  # "game" | "meme" | "anime"
-                    art_prompt = f"micro pixel sprite {tmpl.title}"
-                    pal0 = tmpl.palettes[0]
-                    c1 = pal0.get("P", def_c1)
-                    c2 = pal0.get("S", def_c2)
-                    c3 = pal0.get("A", def_c3)
+            elif spawn_kind == "clean_space":
+                bp_w, bp_h = self._dims_for_tier(tier, "clean_space")
+                x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, WHITE_IDX, BLACK_IDX)
+                cname, cslogan = _CLEAN_SPACE_NAMES[f_idx % len(_CLEAN_SPACE_NAMES)]
+                fac_name = cname if cname.lower() not in existing_names else f"{cname} {f_idx + 1}"
+                fac_theme = "pure white empty space"
+                fac_slogan = cslogan
+                art_mode = "clean_space"
+                fac_category = "clean_space"
+                art_prompt = "pure white empty space enclave"
+                c1, c2, c3 = WHITE_IDX, WHITE_IDX, BLACK_IDX
+                sub_name = "CleanCanvas"
+                fluid_cutout = False
 
-                elif cat_choice == "clean_space":
-                    cname, cslogan = _CLEAN_SPACE_NAMES[f_idx % len(_CLEAN_SPACE_NAMES)]
-                    fac_name = cname if cname.lower() not in existing_names else f"{cname} {f_idx + 1}"
-                    fac_theme = "pure white empty space"
-                    fac_slogan = cslogan
-                    art_mode = "clean_space"
-                    fac_category = "clean_space"
-                    art_prompt = "pure white empty space enclave"
-                    c1, c2, c3 = WHITE_IDX, WHITE_IDX, BLACK_IDX
-                    sub_name = "CleanCanvas"
+            elif spawn_kind == "ai_invented":
+                idea: AIFactionIdea | None = None
+                while self._idea_queue:
+                    cand_idea = self._idea_queue.popleft()
+                    if cand_idea.name.lower() not in existing_names:
+                        idea = cand_idea
+                        break
 
-                elif cat_choice == "painting":
-                    avail_p = [pa for pa in FINE_ART_CATALOG if pa.key not in existing_paint_keys] or FINE_ART_CATALOG
-                    pa = self.rng.choice(avail_p)
-                    existing_paint_keys.add(pa.key)
-                    extra_key = pa.key
-                    fac_name = f"r/Art {pa.name}" if f"r/Art {pa.name}".lower() not in existing_names else f"{pa.name} {f_idx + 1}"
-                    fac_theme = f"{pa.artist} {pa.name}"
-                    fac_slogan = f"Preserve {pa.name} in pixel gold!"
-                    art_mode = "painting"
-                    fac_category = "painting"
-                    art_prompt = pa.prompt
-                    c1, c2, c3 = pa.primary, pa.secondary, pa.accent
-                    theme_desc = pa.color_theme
-                    sub_name = "Art"
-
-                elif cat_choice == "fractal":
-                    fname, fkind, fslogan = _FRACTAL_NAMES[f_idx % len(_FRACTAL_NAMES)]
-                    extra_key = fkind
-                    fac_name = fname if fname.lower() not in existing_names else f"{fname} {f_idx + 1}"
-                    fac_theme = f"{fkind} mathematical fractal"
-                    fac_slogan = fslogan
-                    art_mode = "fractal"
-                    fac_category = "fractal"
-                    art_prompt = f"{fkind} pixel fractal"
-                    c1, c2, c3 = BLACK_IDX, PURPLE_IDX, def_c2
-                    sub_name = "fractals"
-
-                elif cat_choice == "comic_strip" and pre_comic is not None:
-                    existing_comic_keys.add(pre_comic.key)
-                    extra_key = pre_comic.key
-                    fac_name = pre_comic.title if pre_comic.title.lower() not in existing_names else f"{pre_comic.title} {f_idx + 1}"
-                    fac_theme = f"pixel comic strip: {pre_comic.title}"
-                    fac_slogan = pre_comic.slogan
-                    art_mode = "comic_strip"
-                    fac_category = "comic"
-                    art_prompt = f"multi-panel comic strip {pre_comic.title}"
-                    c1, c2, c3 = pre_comic.primary, pre_comic.secondary, pre_comic.accent
-                    sub_name = "comics"
-
-                elif cat_choice == "cartoon_meme" and pre_meme is not None:
-                    existing_meme_keys.add(pre_meme.key)
-                    extra_key = pre_meme.key
-                    fac_name = pre_meme.title if pre_meme.title.lower() not in existing_names else f"{pre_meme.title} {f_idx + 1}"
-                    fac_theme = f"pixel {pre_meme.category}: {pre_meme.title}"
-                    fac_slogan = pre_meme.slogan
-                    art_mode = "cartoon_meme"
-                    fac_category = pre_meme.category
-                    art_prompt = f"pixel art {pre_meme.category} {pre_meme.title}"
-                    c1, c2, c3 = pre_meme.primary, pre_meme.secondary, pre_meme.accent
-                    sub_name = "memes" if pre_meme.category == "meme" else "cartoons"
-
-                elif cat_choice == "banner" and (tier == "micro" or fast_banner_override):
-                    if tier == "micro":
-                        if f_idx % 2 == 0:
-                            short_tag, slogan_txt = _LOGO_WORDMARKS[f_idx % len(_LOGO_WORDMARKS)]
+                if idea is not None:
+                    ai_origin = True
+                    tz_region = idea.timezone_region
+                    lang_code = idea.language or "en"
+                    art_mode = idea.art_mode
+                    # Throttle FLUX calls per wave so fast ai_code / banner ideas keep discovery snappy
+                    if art_mode in ("flux_art", "flux_comic") and (not self.cfg.use_flux_art or flux_calls_in_wave >= max_flux_per_wave):
+                        if idea.banner_text and len(idea.banner_text.strip()) >= 2:
+                            art_mode = "banner"
                         else:
-                            short_tag = f"r/{sub_name[:6]}" if len(sub_name) <= 6 else sub_name[:6].upper()
-                            slogan_txt = f"Represent {short_tag}!"
-                    else:
-                        if f_idx % 3 != 0:
-                            short_tag, slogan_txt = _LOGO_WORDMARKS[f_idx % len(_LOGO_WORDMARKS)]
-                        else:
-                            short_tag = f"r/{sub_name[:8]}" if len(sub_name) <= 8 else sub_name[:8].upper()
-                            slogan_txt = f"Represent {short_tag}!"
-                    fac_name = short_tag if short_tag.lower() not in existing_names else f"{short_tag} {f_idx + 1}"
-                    fac_theme = f"stylized text logo {short_tag}"
-                    fac_slogan = slogan_txt
-                    art_mode = "banner"
-                    fac_category = "logo"
-                    art_prompt = f"stylized pixel text logo {short_tag}"
-                    c1, c2, c3 = def_c1, def_c2, def_c3
-                    typo_spec = self._fast_typography_spec(
-                        short_tag,
-                        c1,
-                        c2,
-                        c3,
-                        f_idx,
-                        is_micro=(tier == "micro"),
-                        allow_flux=(tier == "macro"),
+                            art_mode = "ai_code"
+                    if art_mode == "flux_comic" and tier == "micro":
+                        tier = "medium"
+
+                    bp_w, bp_h = self._dims_for_tier(tier, art_mode, aspect=idea.aspect)
+                    x0, y0, is_cameo, is_corner, is_edge, cand_crop_pil, cand_crop_rgb, dom_names = self._pick_spawn_slot(
+                        tier, bp_w, bp_h, allow_cameo=(tier == "micro" and len(sim_alive) >= 20 and self.rng.random() < 0.2),
+                        def_c1=def_c1, def_c2=def_c2,
                     )
 
-                else:
-                    # Full Qwen2.5-VL Pareidolia + Typography Studio for Macro/Medium Diffusion, Procedural, & Hero Wordmarks
-                    vlm_calls_in_wave += 1
-                    desired_mode = cat_choice if cat_choice in ("diffusion", "procedural", "banner") else "diffusion"
-                    if desired_mode == "diffusion" and not self.cfg.use_diffusion:
-                        desired_mode = "procedural"
-                    if is_corner and desired_mode == "banner":
-                        desired_mode = "procedural"
-
-                    self.brain_status = f"Pareidolia ({tier}): Qwen2.5-VL inspecting ({x0},{y0}) for r/{sub_name}..."
-                    proposal, theme_desc = self.brain.pareidolia_discover(
-                        cluster_img=cand_crop_pil,
-                        dominant_color_names=dom_names,
-                        existing_names=existing_names_list,
-                        existing_themes=existing_themes_list,
-                        faction_index=f_idx,
-                        desired_mode=desired_mode,
-                        is_corner=is_corner,
-                        is_edge=is_edge,
-                        subreddit_hint=sub_name,
-                    )
-                    art_mode = proposal.art_mode
-                    if art_mode == "diffusion" and not self.cfg.use_diffusion:
-                        art_mode = "procedural"
-                    c1 = resolve_color(proposal.primary_color, def_c1)
-                    c2 = resolve_color(proposal.secondary_color, def_c2)
-                    c3 = resolve_color(proposal.accent_color, def_c3)
-                    fac_name = proposal.name.strip()[:28]
-                    if fac_name.lower() in existing_names:
-                        fac_name = f"{fac_name[:22]} {f_idx + 1}"
-                    fac_theme = proposal.theme.strip()[:40]
-                    fac_slogan = proposal.slogan.strip()[:90]
-                    art_prompt = proposal.art_prompt.strip()[:120]
-                    fac_category = "logo" if art_mode == "banner" else ("game" if f_idx % 3 == 0 else ("anime" if f_idx % 3 == 1 else "meme"))
-                    btxt = (proposal.banner_text or f"r/{sub_name[:8]}").strip()[:14]
-
-                    if is_corner and art_mode == "procedural":
-                        ctag = (
-                            "top_left" if (x0 == 0 and y0 == 0)
-                            else "top_right" if (x0 > 0 and y0 == 0)
-                            else "bottom_left" if (x0 == 0 and y0 > 0)
-                            else "bottom_right"
+                    # Every ~6th macro/medium AI spawn, run live Vision Pareidolia on the actual canvas crop!
+                    if (
+                        self.ollama_ready
+                        and art_mode == "flux_art"
+                        and tier != "micro"
+                        and (f_idx % 6 == 0)
+                        and flux_calls_in_wave < max_flux_per_wave
+                    ):
+                        self.brain_status = f"Act {self.act} Vision Pareidolia at ({x0},{y0})..."
+                        prop, theme_desc = self.brain.pareidolia_discover(
+                            cluster_img=cand_crop_pil,
+                            dominant_color_names=dom_names,
+                            existing_names=existing_names_list,
+                            existing_themes=existing_themes_list,
+                            faction_index=f_idx,
+                            desired_mode="diffusion",
+                            is_corner=is_corner,
+                            is_edge=is_edge,
+                            subreddit_hint=sub_name,
                         )
-                        art_prompt = f"corner {ctag} {art_prompt}"
+                        if prop.name.lower() not in existing_names:
+                            fac_name = prop.name.strip()[:28]
+                            fac_theme = prop.theme.strip()[:42]
+                            fac_slogan = prop.slogan.strip()[:90]
+                            art_prompt = prop.art_prompt.strip()[:160]
+                            c1 = resolve_color(prop.primary_color, def_c1)
+                            c2 = resolve_color(prop.secondary_color, def_c2)
+                            c3 = resolve_color(prop.accent_color, def_c3)
+                            fac_category = idea.category or "art"
+                            fluid_cutout = True
+                        else:
+                            fac_name = idea.name[:28]
+                            fac_theme = idea.category[:40]
+                            fac_slogan = (idea.slogan or f"{fac_name} unites!")[:90]
+                            art_prompt = idea.art_prompt[:180]
+                            c1 = resolve_color(idea.primary_color, def_c1)
+                            c2 = resolve_color(idea.secondary_color, def_c2)
+                            c3 = resolve_color(idea.accent_color, def_c3)
+                            fac_category = idea.category or "art"
+                            fluid_cutout = idea.fluid_cutout
+                    else:
+                        fac_name = idea.name[:28]
+                        fac_theme = (idea.category or "emergent community")[:40]
+                        fac_slogan = (idea.slogan or f"{fac_name} holds the line!")[:90]
+                        art_prompt = idea.art_prompt[:180]
+                        c1 = resolve_color(idea.primary_color, def_c1)
+                        c2 = resolve_color(idea.secondary_color, def_c2)
+                        c3 = resolve_color(idea.accent_color, def_c3)
+                        fac_category = idea.category or "art"
+                        fluid_cutout = False if art_mode == "flux_comic" else True
 
-                    self.brain_status = f"Typography Studio designing '{fac_name}'..."
-                    typo_spec, flux_style_desc = self.brain.design_typography(
-                        name=fac_name,
-                        theme=fac_theme,
-                        art_mode=art_mode,
-                        art_prompt=art_prompt,
-                        banner_text=btxt,
-                        color_theme=theme_desc,
-                        primary_idx=c1,
-                        secondary_idx=c2,
-                        accent_idx=c3,
-                        faction_index=f_idx,
-                    )
+                    if art_mode in ("flux_art", "flux_comic"):
+                        flux_calls_in_wave += 1
+                        if idea.banner_text and art_mode == "flux_art" and max(bp_w, bp_h) >= 48 and self.rng.random() < 0.35:
+                            typo_spec = self._fast_typography_spec(
+                                idea.banner_text, c1, c2, c3, f_idx, is_micro=True, allow_flux=False
+                            )
+                            typo_spec.placement = "bottom_center"
+                            typo_spec.size_tier = "tiny"
+                    elif art_mode == "banner":
+                        btxt = (idea.banner_text or fac_name[:10]).strip()[:12]
+                        typo_spec = self._fast_typography_spec(
+                            btxt, c1, c2, c3, f_idx, is_micro=(tier == "micro"), allow_flux=False
+                        )
+                        fac_category = "logo"
+                    elif art_mode == "ai_code":
+                        fac_category = "geometric"
+                        if self.ollama_ready:
+                            self.brain_status = f"Qwen3-VL coding geometric pattern for '{fac_name}'..."
+                            ai_code_str = self.brain.write_geometric_code(
+                                name=fac_name,
+                                art_prompt=art_prompt,
+                                w=bp_w,
+                                h=bp_h,
+                                allowed_colors=allowed_colors,
+                            )
+                else:
+                    # Offline fallback when LM Studio/Ollama is unreachable (still <= 1 active copy per template!)
+                    fb_pick = self.rng.random()
+                    if fb_pick < 0.32:
+                        wm_txt, wm_slo, tz_region, lang_code = _LOGO_WORDMARKS[f_idx % len(_LOGO_WORDMARKS)]
+                        bp_w, bp_h = self._dims_for_tier(tier, "banner", aspect="wide")
+                        x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, def_c1, def_c2)
+                        fac_name = wm_txt if wm_txt.lower() not in existing_names else f"{wm_txt} {f_idx + 1}"
+                        fac_theme = f"wordmark {wm_txt}"
+                        fac_slogan = wm_slo
+                        art_mode = "banner"
+                        fac_category = "logo"
+                        art_prompt = f"stylized wordmark {wm_txt}"
+                        c1, c2, c3 = def_c1, def_c2, def_c3
+                        typo_spec = self._fast_typography_spec(wm_txt, c1, c2, c3, f_idx, is_micro=(tier == "micro"), allow_flux=False)
+                    elif fb_pick < 0.50:
+                        avail_c = [c for c in COMIC_CATALOG if c.key not in active_comic_keys]
+                        if avail_c and tier != "micro":
+                            cm = self.rng.choice(avail_c)
+                            active_comic_keys.add(cm.key)
+                            extra_key = cm.key
+                            bp_w, bp_h = self._dims_for_tier(tier, "flux_comic", aspect="wide")
+                            x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, cm.primary, cm.secondary)
+                            fac_name = cm.title if cm.title.lower() not in existing_names else f"{cm.title} {f_idx + 1}"
+                            fac_theme = f"comic: {cm.title}"
+                            fac_slogan = cm.slogan
+                            art_mode = "comic_strip"
+                            fac_category = "comic"
+                            art_prompt = f"comic strip {cm.title}"
+                            c1, c2, c3 = cm.primary, cm.secondary, cm.accent
+                            fluid_cutout = False
+                        else:
+                            fname, fkind, fslogan = _FRACTAL_NAMES[f_idx % len(_FRACTAL_NAMES)]
+                            extra_key = fkind
+                            bp_w, bp_h = self._dims_for_tier(tier, "fractal")
+                            x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, BLACK_IDX, PURPLE_IDX)
+                            fac_name = fname if fname.lower() not in existing_names else f"{fname} {f_idx + 1}"
+                            fac_theme = f"{fkind} fractal"
+                            fac_slogan = fslogan
+                            art_mode = "fractal"
+                            fac_category = "geometric"
+                            art_prompt = f"{fkind} geometric fractal"
+                            c1, c2, c3 = BLACK_IDX, PURPLE_IDX, def_c2
+                    elif fb_pick < 0.72:
+                        avail_m = [m for m in CARTOON_MEME_CATALOG if m.key not in active_meme_keys]
+                        if avail_m:
+                            mm = self.rng.choice(avail_m)
+                            active_meme_keys.add(mm.key)
+                            extra_key = mm.key
+                            bp_w, bp_h = self._dims_for_tier(tier, "flux_art")
+                            x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, mm.primary, mm.secondary)
+                            fac_name = mm.title if mm.title.lower() not in existing_names else f"{mm.title} {f_idx + 1}"
+                            fac_theme = mm.title
+                            fac_slogan = mm.slogan
+                            art_mode = "cartoon_meme"
+                            fac_category = mm.category
+                            art_prompt = mm.title
+                            c1, c2, c3 = mm.primary, mm.secondary, mm.accent
+                        else:
+                            avail_s = [k for k in SPRITE_KEYS if k not in active_sprite_keys] or SPRITE_KEYS
+                            skey = self.rng.choice(avail_s)
+                            active_sprite_keys.add(skey)
+                            extra_key = skey
+                            bp_w, bp_h = self._dims_for_tier("micro", "micro_sprite")
+                            x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot("micro", bp_w, bp_h, False, def_c1, def_c2)
+                            fac_name = f"r/{sub_name[:12]}" if f"r/{sub_name[:12]}".lower() not in existing_names else f"Pixel {f_idx + 1}"
+                            fac_theme = f"pixel sprite {skey}"
+                            fac_slogan = f"{fac_name} holds the grid!"
+                            art_mode = "micro_sprite"
+                            fac_category = "game"
+                            art_prompt = f"pixel sprite {skey}"
+                            c1, c2, c3 = def_c1, def_c2, def_c3
+                    else:
+                        bp_w, bp_h = self._dims_for_tier(tier, "procedural")
+                        x0, y0, is_cameo, _, _, _, cand_crop_rgb, _ = self._pick_spawn_slot(tier, bp_w, bp_h, False, def_c1, def_c2)
+                        fac_name = f"r/{sub_name[:12]}" if f"r/{sub_name[:12]}".lower() not in existing_names else f"Guild {f_idx + 1}"
+                        fac_theme = f"emergent pixel emblem ({theme_desc})"
+                        fac_slogan = f"Defend {fac_name}!"
+                        art_mode = "procedural"
+                        fac_category = "art"
+                        art_prompt = f"pixel emblem for {fac_name}"
+                        c1, c2, c3 = def_c1, def_c2, def_c3
 
-            # --- 3. Generate Blueprint ---
-            self.brain_status = f"Creating {tier}/{art_mode} blueprint for '{fac_name}'..."
+            # --- 3. Generate Blueprint strictly within unlocked palette ---
+            with self._state_lock:
+                cur_allowed = self.canvas.allowed_colors
+                W_act, H_act = self.canvas.active_w, self.canvas.active_h
+
+            self.brain_status = f"Act {self.act} forging {tier}/{art_mode} '{fac_name}' [{tz_region}]..."
             bp_np, text_engine_used = self.art.create_blueprint(
                 art_mode=art_mode,
                 prompt=art_prompt,
@@ -1070,19 +1285,24 @@ class SimulationEngine:
                 color_theme=theme_desc,
                 typography=typo_spec,
                 flux_style_desc=flux_style_desc,
-                ocr_verifier=self.brain.verify_wordmark_ocr,
+                ocr_verifier=None,  # Styled Unicode typography is guaranteed crisp; FLUX art has pure visuals
                 live_crop_rgb=cand_crop_rgb,
                 seed=self.cfg.seed + self.next_faction_id * 97 + tick + i * 31,
                 extra_key=extra_key,
                 ribbon_axis=ribbon_axis or "h",
+                allowed_colors=cur_allowed,
+                fluid_cutout=fluid_cutout,
+                ai_code=ai_code_str,
             )
             bp_h_actual, bp_w_actual = int(bp_np.shape[0]), int(bp_np.shape[1])
-            x0 = max(0, min(self.cfg.width - bp_w_actual, x0))
-            y0 = max(0, min(self.cfg.height - bp_h_actual, y0))
+            x0 = max(0, min(W_act - bp_w_actual, x0))
+            y0 = max(0, min(H_act - bp_h_actual, y0))
             valid_px = int((bp_np >= 0).sum())
 
-            # --- 4. Commit Faction & Proportional Recruitment ---
+            # --- 4. Commit Faction & Recruit Citizens ---
             with self._state_lock:
+                if self.canvas.is_whiteout:
+                    break
                 fid = self.next_faction_id
                 self.next_faction_id += 1
                 bp_t = torch.from_numpy(bp_np.astype(np.int16)).to(self.device)
@@ -1116,13 +1336,12 @@ class SimulationEngine:
                     ribbon_thickness=ribbon_thick,
                     is_cameo=is_cameo,
                     last_morph_tick=self.tick,
+                    timezone_region=tz_region,
+                    language=lang_code,
+                    ai_origin=ai_origin,
+                    burnout_rate=round(self.rng.uniform(0.75, 1.45), 2),
                 )
-                style_tag = (
-                    f"{text_engine_used}:{typo_spec.font_style}/{typo_spec.color_effect}"
-                    if (typo_spec is not None and typo_spec.include_text)
-                    else art_mode
-                )
-                fac.remember(f"Born ({tier}/{fac_category}) at ({x0},{y0}) [{bp_w_actual}x{bp_h_actual}].")
+                fac.remember(f"Born ({tier}/{fac_category}/{tz_region}) at ({x0},{y0}) [{bp_w_actual}x{bp_h_actual}].")
                 self.factions.append(fac)
                 sim_alive.append(fac)
 
@@ -1130,16 +1349,20 @@ class SimulationEngine:
                 recruited = self.policy.recruit_initial_members(fac, target_count=target_rec)
                 fac.member_count = recruited
                 self.diplomacy.post_public(self.tick, fac, fac.slogan, kind="propaganda")
-                cameo_tag = " [CAMEO]" if is_cameo else ""
+                ai_tag = " [AI]" if ai_origin else ""
                 self.logger.log_chronicle(
                     self.tick,
                     "founded",
-                    f"New {tier} {fac_category} '{fac.name}' ({bp_w_actual}x{bp_h_actual}, {style_tag}){cameo_tag} at ({x0},{y0}) — {recruited} citizens!",
+                    f"New {tier} {fac_category}{ai_tag} '{fac.name}' ({bp_w_actual}x{bp_h_actual}, {art_mode}, {tz_region}/{lang_code}) "
+                    f"at ({x0},{y0}) — {recruited} citizens!",
                     faction_id=fac.id,
                     faction_name=fac.name,
                     size_tier=tier,
                     category=fac_category,
                     art_mode=art_mode,
+                    ai_origin=ai_origin,
+                    timezone_region=tz_region,
+                    language=lang_code,
                     bbox=[fac.x0, fac.y0, fac.x1, fac.y1],
                 )
                 existing_names.add(fac.name.lower())
@@ -1147,36 +1370,191 @@ class SimulationEngine:
                 existing_themes_list.append(fac.theme)
                 created.append(fac)
 
-        self.brain_status = f"Active ({len([f for f in self.factions if f.alive])} factions competing)"
+        self.brain_status = (
+            f"Act {self.act} (Hr {self.virtual_hour:.1f}/72) — "
+            f"{len([f for f in self.factions if f.alive])} active factions"
+        )
         return created
 
-    def _run_autonomous_micro_and_flag_diplomacy(self, alive_art: list[Faction]) -> None:
-        """Fast local diplomacy so 200 Micro/Flag factions form Indie-Alliance clusters & flag rivalries without bottlenecking Ollama."""
+    # ------------------------------------------------------------------
+    # Regional Streamer Flash-Raids (REQ-DIP-008)
+    # ------------------------------------------------------------------
+
+    def spawn_streamer_flash_raid(self) -> Faction | None:
+        """Spawn a prime-time regional streamer blitz right onto established (often sleeping) territory."""
+        if self.canvas.is_whiteout:
+            return None
+
+        with self._state_lock:
+            alive_art = [f for f in self.factions if f.alive and not f.is_void and not f.is_streamer_raid]
+            if len(alive_art) < 6:
+                return None
+            # Only 1 active flash-raid at a time so each blitz is dramatic and clean
+            if any(f.alive and f.is_streamer_raid for f in self.factions):
+                return None
+            prime_tz = self._prime_timezone_now()
+            W_act, H_act = self.canvas.active_w, self.canvas.active_h
+            allowed = self.canvas.allowed_colors
+
+            # Prefer raiding a faction in a sleeping timezone (authentic overnight r/place ambushes!)
+            def _raid_appeal(f: Faction) -> float:
+                awake = timezone_awake_factor(f.timezone_region, self.virtual_hour % 24.0)
+                return (1.6 - awake) + (0.6 if f.size_tier in ("macro", "medium") else 0.0) + self.rng.random() * 0.5
+
+            victims = sorted(alive_art, key=_raid_appeal, reverse=True)
+            anchor = victims[0]
+            nearby_names = [f.name for f in victims[:4]]
+            tick = self.tick
+            s = self._size_scale()
+            bp_w = min(W_act // 4, int(round(self.rng.choice([76, 86, 94]) * s)))
+            bp_h = min(H_act // 4, int(round(self.rng.choice([76, 86, 94]) * s)))
+            rx0 = max(0, min(W_act - bp_w, int(anchor.cx) - bp_w // 2))
+            ry0 = max(0, min(H_act - bp_h, int(anchor.cy) - bp_h // 2))
+
+        self.brain_status = f"FLASH RAID ({prime_tz}) mobilizing against '{anchor.name}'..."
+        idea = (
+            self.brain.invent_streamer_raid(prime_tz, self.virtual_hour, nearby_names, allowed)
+            if self.ollama_ready
+            else None
+        )
+        if idea is not None:
+            r_name = idea.name[:28]
+            r_slogan = (idea.slogan or f"{r_name} RAID! TAKE THE CANVAS!")[:90]
+            r_prompt = idea.art_prompt[:180]
+            r_lang = idea.language or "en"
+            c1 = resolve_color(idea.primary_color, PURPLE_IDX)
+            c2 = resolve_color(idea.secondary_color, YELLOW_IDX)
+            c3 = resolve_color(idea.accent_color, WHITE_IDX)
+        else:
+            r_name = f"{prime_tz.title()} Blitz #{self.next_faction_id + 1}"
+            r_slogan = f"LIVE RAID! {r_name} storms the grid!"
+            r_prompt = "bold fiery neon crown pixel mascot skull emblem wearing headphones, crisp 16-bit arcade sprite"
+            r_lang = "en"
+            c1, c2, c3 = PURPLE_IDX, YELLOW_IDX, WHITE_IDX
+
+        bp_np, _ = self.art.create_blueprint(
+            art_mode="streamer_raid",
+            prompt=r_prompt,
+            w=bp_w,
+            h=bp_h,
+            primary=c1,
+            secondary=c2,
+            accent=c3,
+            label=r_name,
+            theme=f"{prime_tz} streamer raid",
+            seed=self.cfg.seed + tick * 19 + 777,
+            allowed_colors=allowed,
+            fluid_cutout=True,
+        )
+        bp_h_a, bp_w_a = int(bp_np.shape[0]), int(bp_np.shape[1])
+
+        with self._state_lock:
+            if self.canvas.is_whiteout:
+                return None
+            fid = self.next_faction_id
+            self.next_faction_id += 1
+            bp_t = torch.from_numpy(bp_np.astype(np.int16)).to(self.device)
+            duration = self.rng.randint(260, 440)
+            raid_fac = Faction(
+                id=fid,
+                name=r_name,
+                theme=f"streamer flash-raid ({prime_tz})",
+                slogan=r_slogan,
+                art_mode="streamer_raid",
+                art_prompt=r_prompt,
+                primary_color=c1,
+                secondary_color=c2,
+                accent_color=c3,
+                x0=max(0, min(self.canvas.active_w - bp_w_a, rx0)),
+                y0=max(0, min(self.canvas.active_h - bp_h_a, ry0)),
+                w=bp_w_a,
+                h=bp_h_a,
+                blueprint=bp_t,
+                edge_weight=compute_edge_weights(bp_t),
+                created_tick=self.tick,
+                size_tier="macro",
+                category="streamer_raid",
+                timezone_region=prime_tz,
+                language=r_lang,
+                ai_origin=True,
+                is_streamer_raid=True,
+                raid_end_tick=self.tick + duration,
+                hype=2.4,
+                role_weights={"builder": 0.78, "defender": 0.18, "expander": 0.04},
+            )
+            self.factions.append(raid_fac)
+            surge_target = min(7500, max(1200, self.cfg.num_users // 20))
+            if hasattr(self.policy, "mobilize_flash_raid"):
+                recruited = self.policy.mobilize_flash_raid(raid_fac, surge_target)
+            else:
+                recruited = self.policy.recruit_initial_members(raid_fac, surge_target)
+            raid_fac.member_count = recruited
+            self.diplomacy.post_public(self.tick, raid_fac, r_slogan, kind="threat")
+            self.logger.log_chronicle(
+                self.tick,
+                "raid",
+                f"STREAMER FLASH-RAID [{prime_tz}]: '{r_name}' mobilized {recruited:,} citizens onto ({raid_fac.x0},{raid_fac.y0}) over '{anchor.name}' for {duration} ticks!",
+                faction_id=raid_fac.id,
+                timezone_region=prime_tz,
+                bbox=[raid_fac.x0, raid_fac.y0, raid_fac.x1, raid_fac.y1],
+            )
+            return raid_fac
+
+    # ------------------------------------------------------------------
+    # Geopolitical Epochs, Expiring Alliances & Burnout (REQ-SIM-017)
+    # ------------------------------------------------------------------
+
+    def _form_alliance(self, fa: Faction, fb: Faction) -> bool:
+        """Seal a time-limited alliance respecting per-faction partner caps (<= 3, Macro <= 2)."""
+        cap_a = 2 if fa.size_tier == "macro" else 3
+        cap_b = 2 if fb.size_tier == "macro" else 3
+        if len(fa.allies) >= cap_a or len(fb.allies) >= cap_b:
+            return False
+        expiry = self.tick + self.rng.randint(1500, 2600)
+        fa.allies.add(fb.id)
+        fb.allies.add(fa.id)
+        fa.ally_expiry[fb.id] = expiry
+        fb.ally_expiry[fa.id] = expiry
+        fa.enemies.discard(fb.id)
+        fb.enemies.discard(fa.id)
+        fa.pending_ally_offers.discard(fb.id)
+        fb.pending_ally_offers.discard(fa.id)
+        return True
+
+    def _expire_stale_alliances(self, alive_art: list[Faction]) -> None:
         fac_by_id = {f.id: f for f in alive_art}
-        # 1. Micro-sprite neighborhood alliances
+        for f in alive_art:
+            expired = [aid for aid, exp_t in list(f.ally_expiry.items()) if self.tick >= exp_t or aid not in fac_by_id]
+            for aid in expired:
+                f.allies.discard(aid)
+                f.ally_expiry.pop(aid, None)
+                other = fac_by_id.get(aid)
+                if other is not None:
+                    other.allies.discard(f.id)
+                    other.ally_expiry.pop(f.id, None)
+
+    def _run_autonomous_micro_and_flag_diplomacy(self, alive_art: list[Faction]) -> None:
+        """Fast local diplomacy for micro neighborhoods and national flag border rivalries."""
+        fac_by_id = {f.id: f for f in alive_art}
         micros = [f for f in alive_art if f.size_tier == "micro" and f.art_mode != "clean_space" and f.integrity >= 0.45]
         self.rng.shuffle(micros)
-        for mf in micros[:14]:
+        for mf in micros[:16]:
             if len(mf.allies) >= 3:
                 continue
-            nbrs = describe_neighbors(mf, self.factions, max_gap=18)
+            nbrs = describe_neighbors(mf, self.factions, max_gap=20)
             for n in nbrs[:2]:
                 other = fac_by_id.get(n["id"])
                 if other is None or other.is_void or other.id in mf.allies or other.art_mode == "clean_space":
                     continue
-                if other.size_tier == "micro" and self.rng.random() < 0.45:
-                    mf.allies.add(other.id)
-                    other.allies.add(mf.id)
-                    mf.enemies.discard(other.id)
-                    other.enemies.discard(mf.id)
-                    mf.remember(f"Joined micro alliance with {other.name}!")
+                if other.size_tier == "micro" and self.rng.random() < 0.38:
+                    if self._form_alliance(mf, other):
+                        mf.remember(f"Joined micro alliance with {other.name}!")
                     break
 
-        # 2. Adjacent national flag border rivalries and peace treaties
         flags = [f for f in alive_art if f.category == "flag" and f.integrity >= 0.55]
         self.rng.shuffle(flags)
         for fl in flags[:6]:
-            nbrs = describe_neighbors(fl, self.factions, max_gap=28)
+            nbrs = describe_neighbors(fl, self.factions, max_gap=32)
             flag_nbrs = [
                 fac_by_id[n["id"]]
                 for n in nbrs
@@ -1187,8 +1565,7 @@ class SimulationEngine:
             rival = flag_nbrs[0]
             if rival.id in fl.allies or rival.id in fl.enemies:
                 continue
-            if self.rng.random() < 0.52:
-                # Flag border rivalry
+            if self.rng.random() < 0.58:
                 fl.raid_target_id = rival.id
                 fl.enemies.add(rival.id)
                 rival.enemies.add(fl.id)
@@ -1201,98 +1578,100 @@ class SimulationEngine:
                     defender=rival.id,
                 )
             else:
-                # Flag border peace treaty
-                fl.allies.add(rival.id)
-                rival.allies.add(fl.id)
-                self.logger.log_chronicle(
-                    self.tick,
-                    "alliance",
-                    f"FLAG TREATY: '{fl.name}' & '{rival.name}' sealed border hearts!",
-                    faction_a=fl.id,
-                    faction_b=rival.id,
-                )
+                if self._form_alliance(fl, rival):
+                    self.logger.log_chronicle(
+                        self.tick,
+                        "alliance",
+                        f"FLAG TREATY: '{fl.name}' & '{rival.name}' sealed border hearts!",
+                        faction_a=fl.id,
+                        faction_b=rival.id,
+                    )
 
     def run_geopolitical_epoch(self) -> None:
-        """Run one geopolitical round: VLM leads 6 frontline/macro/medium factions + fast autonomy for 200-faction ecosystem."""
+        """Run one geopolitical round: alliance expiry, burnout turnover, autonomous diplomacy, and VLM leadership."""
+        if self.canvas.is_whiteout:
+            return
+
         with self._state_lock:
             self.epoch += 1
             ep = self.epoch
             tick = self.tick
             update_faction_metrics(self.canvas, self.factions, self.policy.user_factions)
             self._manage_void_lifecycle()
-            alive_art = [f for f in self.factions if f.alive and not f.is_void]
+            self._manage_flash_raids()
+            alive_art = [f for f in self.factions if f.alive and not f.is_void and not f.is_streamer_raid]
             if not alive_art:
                 self.brain_status = "Waiting for factions to emerge..."
                 return
 
-            # Natural era turnover + tier-appropriate collapse check across all active factions
+            self._expire_stale_alliances(alive_art)
+
+            # Community burnout & dynamic turnover across all 72 virtual hours (REQ-SIM-017)
             for f in alive_art:
                 age = tick - f.created_tick
-                if age > 2800:
-                    f.hype = max(0.32, f.hype * 0.96)
-                min_mem = 14 if f.size_tier == "micro" else (45 if f.size_tier == "medium" else 75)
-                if f.integrity < 0.14 and f.member_count < min_mem:
+                if self.cfg.enable_burnout and age > 1600:
+                    decay = max(0.86, 0.955 - 0.025 * f.burnout_rate)
+                    if f.integrity < 0.45:
+                        decay -= 0.03
+                    f.hype = max(0.08, f.hype * decay)
+                min_mem = 12 if f.size_tier == "micro" else (36 if f.size_tier == "medium" else 65)
+                if f.hype < 0.18 or (f.integrity < 0.22 and f.member_count < min_mem):
                     f.low_integrity_epochs += 1
-                elif age > 5000 and f.integrity < 0.35 and f.member_count < min_mem * 2:
+                elif age > 3600 and f.integrity < 0.42 and f.member_count < min_mem * 2:
                     f.low_integrity_epochs += 1
                 else:
                     f.low_integrity_epochs = 0
 
-                if f.low_integrity_epochs >= 4:
+                if f.low_integrity_epochs >= 3:
                     f.alive = False
                     self.policy.release_faction_members(f.id)
                     self.logger.log_chronicle(
                         self.tick,
                         "collapse",
-                        f"'{f.name}' ({f.size_tier}) dissolved back into free agents.",
+                        f"'{f.name}' ({f.size_tier}, {f.timezone_region}) burned out and dissolved, opening territory for new art.",
                         faction_id=f.id,
                     )
 
-            alive_art = [f for f in self.factions if f.alive and not f.is_void]
+            alive_art = [f for f in self.factions if f.alive and not f.is_void and not f.is_streamer_raid]
             if not alive_art:
                 return
 
-            # Local diplomacy for micro neighborhoods and national flag borders
             self._run_autonomous_micro_and_flag_diplomacy(alive_art)
 
-            # Select up to 6 active factions for full Qwen2.5-VL epoch decisions (keeps epoch <= 25s)
+            # Select up to 4 high-urgency frontline factions for Qwen3-VL vision leadership
             def _urgency(f: Faction) -> float:
-                u = self.rng.random() * 0.45
+                u = self.rng.random() * 0.5
                 if f.size_tier in ("macro", "ribbon"):
                     u += 0.9
                 elif f.size_tier == "medium":
                     u += 0.5
-                if f.category == "flag":
-                    u += 0.35
                 if f.pending_ally_offers:
                     u += 2.0
-                if f.integrity >= 0.78:
-                    u += 1.1
                 if f.recent_churn >= 0.8:
-                    u += 1.0
-                if f.integrity < 0.35:
-                    u += 0.8
+                    u += 1.1
+                if f.integrity < 0.40:
+                    u += 0.9
                 return u
 
-            chosen = sorted(alive_art, key=_urgency, reverse=True)[:6]
+            chosen = sorted(alive_art, key=_urgency, reverse=True)[:4]
 
         for fac in chosen:
-            if self.stop_requested or not fac.alive:
+            if self.stop_requested or not fac.alive or self.canvas.is_whiteout:
                 continue
 
             with self._state_lock:
                 view_img = self.canvas.render_faction_view_pil(fac, self.factions, margin=36)
-                neighbors = describe_neighbors(fac, self.factions, max_gap=44)
+                neighbors = describe_neighbors(fac, self.factions, max_gap=48)
                 inbox = self.diplomacy.pop_inbox(fac.id)
                 public_feed = self.diplomacy.recent_public(6)
                 cur_tick = self.tick
 
             can_morph = (
-                (cur_tick - fac.last_morph_tick >= 280)
-                and (fac.evolution_stage < 5)
-                and (fac.art_mode not in ("flag", "micro_sprite", "clean_space", "ribbon", "painting"))
+                (cur_tick - fac.last_morph_tick >= 420)
+                and (fac.evolution_stage < 4)
+                and (fac.art_mode not in ("flag", "micro_sprite", "clean_space", "ribbon", "painting", "flux_comic", "comic_strip"))
             )
-            self.brain_status = f"Epoch {ep}: Qwen2.5-VL leading '{fac.name}' ({fac.size_tier})..."
+            self.brain_status = f"Act {self.act} Epoch {ep}: Qwen3-VL leading '{fac.name}' ({fac.timezone_region})..."
             decision = self.brain.faction_epoch_turn(
                 faction=fac,
                 view_img=view_img,
@@ -1304,11 +1683,11 @@ class SimulationEngine:
             )
             self._apply_faction_decision(fac, decision, neighbors, can_morph=can_morph)
 
-        # Trigger Void variant cycle (tendrils, black hole, fractal, monster)
         with self._state_lock:
             has_void = any(f.alive and f.is_void for f in self.factions)
             if (
                 self.cfg.enable_void
+                and not self.canvas.is_whiteout
                 and not has_void
                 and self.tick >= self.cfg.void_min_tick
                 and len(alive_art) >= 8
@@ -1318,7 +1697,9 @@ class SimulationEngine:
 
             self._refresh_shared_borders()
 
-        self.brain_status = f"Epoch {ep} complete — {len([f for f in self.factions if f.alive])} active factions"
+        self.brain_status = (
+            f"Act {self.act} Epoch {ep} complete — {len([f for f in self.factions if f.alive])} active factions"
+        )
 
     def _apply_faction_decision(
         self, fac: Faction, dec: FactionDecision, neighbors: list[dict], can_morph: bool = True
@@ -1347,26 +1728,21 @@ class SimulationEngine:
             partner = fac_by_id.get(aid) if aid is not None else None
             if partner is not None and not partner.is_void:
                 with self._state_lock:
-                    fac.allies.add(partner.id)
-                    partner.allies.add(fac.id)
-                    fac.enemies.discard(partner.id)
-                    partner.enemies.discard(fac.id)
-                    fac.pending_ally_offers.discard(partner.id)
-                    partner.pending_ally_offers.discard(fac.id)
-                    fac.hype = min(2.0, fac.hype + 0.25)
-                    partner.hype = min(2.0, partner.hype + 0.25)
-                    fac.remember(f"Signed border-heart alliance with {partner.name}.")
-                    partner.remember(f"{fac.name} accepted our alliance!")
-                    msg = dec.diplomacy_message or f"Alliance sealed between {fac.name} and {partner.name}!"
-                    self.diplomacy.post_public(self.tick, fac, msg, kind="accept")
-                    self.logger.log_chronicle(
-                        self.tick,
-                        "alliance",
-                        f"ALLIANCE SIGNED: '{fac.name}' & '{partner.name}' agreed to weave border hearts! ({dec.reasoning})",
-                        faction_a=fac.id,
-                        faction_b=partner.id,
-                    )
-                return
+                    if self._form_alliance(fac, partner):
+                        fac.hype = min(2.0, fac.hype + 0.22)
+                        partner.hype = min(2.0, partner.hype + 0.22)
+                        fac.remember(f"Signed border-heart alliance with {partner.name}.")
+                        partner.remember(f"{fac.name} accepted our alliance!")
+                        msg = dec.diplomacy_message or f"Alliance sealed between {fac.name} and {partner.name}!"
+                        self.diplomacy.post_public(self.tick, fac, msg, kind="accept")
+                        self.logger.log_chronicle(
+                            self.tick,
+                            "alliance",
+                            f"ALLIANCE SIGNED: '{fac.name}' & '{partner.name}' agreed to weave border hearts! ({dec.reasoning})",
+                            faction_a=fac.id,
+                            faction_b=partner.id,
+                        )
+                        return
             action = "BUILD"
 
         if action == "PROPOSE_ALLIANCE":
@@ -1376,7 +1752,8 @@ class SimulationEngine:
                     if cand is not None and not cand.is_void and cand.id not in fac.allies:
                         tgt = cand
                         break
-            if tgt is not None and not tgt.is_void and tgt.id not in fac.allies:
+            cap = 2 if fac.size_tier == "macro" else 3
+            if tgt is not None and not tgt.is_void and tgt.id not in fac.allies and len(fac.allies) < cap:
                 with self._state_lock:
                     tgt.pending_ally_offers.add(fac.id)
                     msg = dec.diplomacy_message or f"Truce and border hearts, {tgt.name}?"
@@ -1407,6 +1784,8 @@ class SimulationEngine:
                     was_ally = tgt.id in fac.allies
                     fac.allies.discard(tgt.id)
                     tgt.allies.discard(fac.id)
+                    fac.ally_expiry.pop(tgt.id, None)
+                    tgt.ally_expiry.pop(fac.id, None)
                     fac.role_weights = {"builder": 0.30, "defender": 0.25, "expander": 0.45}
                     msg = dec.diplomacy_message or f"{fac.name} marches on {tgt.name}!"
                     self.diplomacy.send_direct(self.tick, fac, tgt.id, msg, kind="threat")
@@ -1424,17 +1803,12 @@ class SimulationEngine:
                 return
             action = "BUILD"
 
-        # Enforce per-tier expansion size limits
-        tier_max_w, tier_max_h = _TIER_MAX_DIM.get(fac.size_tier, (58, 58))
+        sc = self._size_scale()
+        tier_max_w = int(round((34 if fac.size_tier == "micro" else (68 if fac.size_tier == "medium" else 132)) * sc))
+        tier_max_h = int(round((34 if fac.size_tier == "micro" else (68 if fac.size_tier == "medium" else 132)) * sc))
         if fac.art_mode == "banner":
-            tier_max_w = 136 if fac.size_tier == "macro" else (84 if fac.size_tier == "medium" else 34)
-            tier_max_h = 44 if fac.size_tier == "macro" else (30 if fac.size_tier == "medium" else 16)
-        elif fac.art_mode == "flag":
-            tier_max_w = 80 if fac.size_tier == "macro" else (50 if fac.size_tier == "medium" else 26)
-            tier_max_h = 52 if fac.size_tier == "macro" else (34 if fac.size_tier == "medium" else 17)
-        elif fac.art_mode == "comic_strip":
-            tier_max_w = 104 if fac.size_tier == "macro" else 74
-            tier_max_h = 58 if fac.size_tier == "macro" else 48
+            tier_max_w = int(round((140 if fac.size_tier == "macro" else (88 if fac.size_tier == "medium" else 42)) * sc))
+            tier_max_h = int(round((48 if fac.size_tier == "macro" else (32 if fac.size_tier == "medium" else 18)) * sc))
 
         if action == "MORPH_ART" and not can_morph:
             action = "FORTIFY" if not fac.has_border_frame else "BUILD"
@@ -1459,6 +1833,7 @@ class SimulationEngine:
                         typography=t_spec,
                         already_stamped=fac.text_stamped,
                         art_mode=fac.art_mode,
+                        allowed_colors=self.canvas.allowed_colors,
                     )
                     fac.set_blueprint(fort_np, device=self.device)
                     fac.has_border_frame = True
@@ -1471,7 +1846,7 @@ class SimulationEngine:
                 self.logger.log_chronicle(
                     self.tick,
                     "fortify",
-                    f"'{fac.name}' fortified its borders. ({dec.reasoning})",
+                    f"'{fac.name}' fortified its silhouette. ({dec.reasoning})",
                     faction_id=fac.id,
                 )
             return
@@ -1502,19 +1877,14 @@ class SimulationEngine:
                 new_prompt = raw_new
             else:
                 base = fac.art_prompt.replace("evolved ", "").split(",")[0].strip()[:65]
-                flair = self.rng.choice(
-                    [
-                        "with pixel sparkles",
-                        "upgraded detailed 16-bit emblem",
-                        "with arcade shading",
-                        "with festive pixel ribbons",
-                    ]
-                )
+                flair = self.rng.choice(["with pixel sparkles", "upgraded detailed 16-bit emblem", "with arcade shading", "with festive pixel ribbons"])
                 new_prompt = f"{base} {flair}"
             with self._state_lock:
+                W_act, H_act = self.canvas.active_w, self.canvas.active_h
+                allowed = self.canvas.allowed_colors
                 nx0, ny0, nw, nh = fac.x0, fac.y0, fac.w, fac.h
                 if action == "EXPAND":
-                    grow = 10 if fac.size_tier == "medium" else 14
+                    grow = 10 if fac.size_tier == "medium" else 16
                     dx, dy = fac.expand_dir
                     if dx == 0 and dy == 0:
                         dx, dy = self.rng.choice([(1, 0), (-1, 0), (0, 1), (0, -1)])
@@ -1533,10 +1903,10 @@ class SimulationEngine:
                     else:
                         nw = min(tier_max_w, nw + 8)
                         nh = min(tier_max_h, nh + (4 if fac.art_mode == "banner" else 8))
-                    nx0, ny0 = _snap_to_walls(nx0, ny0, nw, nh, self.cfg.width, self.cfg.height, snap=12)
+                    nx0, ny0 = _snap_to_walls(nx0, ny0, nw, nh, W_act, H_act, snap=12)
 
                 live_crop_rgb = self.canvas.crop_rgb_numpy(nx0, ny0, nx0 + nw, ny0 + nh)
-                next_stage = min(5, fac.evolution_stage + 1)
+                next_stage = min(4, fac.evolution_stage + 1)
                 seed_val = self.cfg.seed + fac.id * 1009 + self.tick
 
             self.brain_status = f"Morphing '{fac.name}' Stage {next_stage} ({fac.art_mode})..."
@@ -1554,22 +1924,24 @@ class SimulationEngine:
                 theme=fac.theme,
                 color_theme=fac.color_theme,
                 typography=t_spec,
-                ocr_verifier=self.brain.verify_wordmark_ocr,
                 stage=next_stage,
                 strength=0.82 if action == "MORPH_ART" else 0.86,
                 seed=seed_val,
                 extra_key=fac.extra_key,
                 ribbon_axis=fac.ribbon_axis or "h",
+                allowed_colors=allowed,
             )
 
             with self._state_lock:
+                if self.canvas.is_whiteout:
+                    return
                 fac.set_blueprint(morphed_np, x0=nx0, y0=ny0, device=self.device)
-                fac.art_prompt = new_prompt[:120]
+                fac.art_prompt = new_prompt[:140]
                 fac.evolution_stage = next_stage
                 fac.has_border_frame = False
                 fac.text_stamped = bool(t_spec is not None and t_spec.include_text and max(nw, nh) >= 34)
                 fac.last_morph_tick = self.tick
-                fac.hype = min(2.2, fac.hype + 0.30)
+                fac.hype = min(2.2, fac.hype + 0.25)
                 fac.remember(f"Stage {next_stage} {action}: '{new_prompt}'.")
                 msg = dec.diplomacy_message or f"{fac.name} evolves: {new_prompt}!"
                 self.diplomacy.post_public(self.tick, fac, msg, kind="propaganda")
@@ -1594,12 +1966,16 @@ class SimulationEngine:
 
     def spawn_void_eruption(self, force: bool = False, variant: str | None = None) -> Faction | None:
         with self._state_lock:
+            if self.canvas.is_whiteout:
+                return None
             if any(f.alive and f.is_void for f in self.factions) and not force:
                 return None
             v_kind = variant or _VOID_VARIANTS[self._void_cycle_idx % len(_VOID_VARIANTS)]
             self._void_cycle_idx += 1
 
-            size = 86 if v_kind in ("black_hole", "monster") else (76 if v_kind == "fractal" else 92)
+            s = self._size_scale()
+            base_sz = 92 if v_kind in ("black_hole", "monster") else (84 if v_kind == "fractal" else 102)
+            size = min(self.canvas.active_w // 4, int(round(base_sz * s)))
             vx0, vy0 = find_void_spawn_spot(self.canvas, self.factions, size=size)
             fid = self.next_faction_id
             self.next_faction_id += 1
@@ -1619,6 +1995,7 @@ class SimulationEngine:
                 bp_np = np.full((size, size), BLACK_IDX, dtype=np.int16)
                 v_name, v_slogan = "THE VOID", "CONSUME ALL PIXELS"
 
+            bp_np = remap_indices_to_allowed(bp_np, self.canvas.allowed_colors)
             bp_t = torch.from_numpy(bp_np.astype(np.int16)).to(self.device)
             void_fac = Faction(
                 id=fid,
@@ -1641,16 +2018,17 @@ class SimulationEngine:
                 category="void",
                 void_variant=v_kind,
                 is_void=True,
-                hype=1.65,
+                hype=1.85,
             )
             self.factions.append(void_fac)
-            recruited = self.policy.recruit_initial_members(void_fac, target_count=1500)
+            void_target = min(5500, max(1500, self.cfg.num_users // 24))
+            recruited = self.policy.recruit_initial_members(void_fac, target_count=void_target)
             void_fac.member_count = recruited
             self.diplomacy.post_public(self.tick, void_fac, v_slogan, kind="threat")
             self.logger.log_chronicle(
                 self.tick,
                 "void",
-                f"VOID ERUPTION [{v_kind.upper()}]: '{v_name}' opened at ({vx0},{vy0}) with {recruited} shadow pixels!",
+                f"VOID ERUPTION [{v_kind.upper()}]: '{v_name}' opened at ({vx0},{vy0}) with {recruited:,} shadow pixels!",
                 faction_id=void_fac.id,
                 void_variant=v_kind,
                 bbox=[void_fac.x0, void_fac.y0, void_fac.x1, void_fac.y1],
@@ -1658,15 +2036,16 @@ class SimulationEngine:
             return void_fac
 
     def _manage_void_lifecycle(self) -> None:
+        max_dim = int(round(140 * self._size_scale()))
         for f in self.factions:
             if not (f.alive and f.is_void):
                 continue
             age = self.tick - f.created_tick
-            if f.void_variant == "tendrils" and age < self.cfg.void_max_duration_ticks // 2 and f.w < 128:
-                f.x0 = max(0, f.x0 - 6)
-                f.y0 = max(0, f.y0 - 6)
-                f.w = min(self.cfg.width - f.x0, f.w + 12)
-                f.h = min(self.cfg.height - f.y0, f.h + 12)
+            if f.void_variant == "tendrils" and age < self.cfg.void_max_duration_ticks // 2 and f.w < max_dim:
+                f.x0 = max(0, f.x0 - 8)
+                f.y0 = max(0, f.y0 - 8)
+                f.w = min(self.canvas.active_w - f.x0, f.w + 16)
+                f.h = min(self.canvas.active_h - f.y0, f.h + 16)
             elif age >= self.cfg.void_max_duration_ticks:
                 f.alive = False
                 self.policy.release_faction_members(f.id)
@@ -1739,6 +2118,13 @@ class SimulationEngine:
                         "morale": f.morale,
                         "hype": f.hype,
                         "memory": f.memory,
+                        "timezone_region": f.timezone_region,
+                        "language": f.language,
+                        "ai_origin": f.ai_origin,
+                        "is_streamer_raid": f.is_streamer_raid,
+                        "raid_end_tick": f.raid_end_tick,
+                        "burnout_rate": f.burnout_rate,
+                        "ally_expiry": {str(k): v for k, v in f.ally_expiry.items()},
                     }
                 )
             if bp_dict:
@@ -1747,6 +2133,11 @@ class SimulationEngine:
             meta = {
                 "tick": self.tick,
                 "epoch": self.epoch,
+                "act": self.act,
+                "virtual_hour": self.virtual_hour,
+                "active_w": self.canvas.active_w,
+                "active_h": self.canvas.active_h,
+                "palette_tier": self.canvas.palette_tier,
                 "next_faction_id": self.next_faction_id,
                 "total_events": self.logger.total_events,
                 "void_cycle_idx": self._void_cycle_idx,
@@ -1777,6 +2168,13 @@ class SimulationEngine:
 
         self.tick = int(meta["tick"])
         self.epoch = int(meta["epoch"])
+        self.act = int(meta.get("act", self.act))
+        self.virtual_hour = float(meta.get("virtual_hour", 0.0))
+        self.canvas.expand_viewport(
+            int(meta.get("active_w", self.cfg.width)),
+            int(meta.get("active_h", self.cfg.height)),
+            int(meta.get("palette_tier", 3)),
+        )
         self.next_faction_id = int(meta["next_faction_id"])
         self._void_cycle_idx = int(meta.get("void_cycle_idx", 0))
         pop = meta.get("population", {})
@@ -1837,6 +2235,13 @@ class SimulationEngine:
                 morale=fd["morale"],
                 hype=fd["hype"],
                 memory=fd.get("memory", []),
+                timezone_region=fd.get("timezone_region", "GLOBAL"),
+                language=fd.get("language", "en"),
+                ai_origin=fd.get("ai_origin", False),
+                is_streamer_raid=fd.get("is_streamer_raid", False),
+                raid_end_tick=fd.get("raid_end_tick", 0),
+                burnout_rate=fd.get("burnout_rate", 1.0),
+                ally_expiry={int(k): int(v) for k, v in fd.get("ally_expiry", {}).items()},
             )
             self.factions.append(fac)
         self._refresh_shared_borders()
@@ -1865,14 +2270,22 @@ class SimulationEngine:
                             seen_w.add(p)
                             wars.append(p)
             pop = self.policy.get_population_stats() if hasattr(self.policy, "get_population_stats") else {}
-            tier_counts = dict(Counter(f.size_tier for f in alive if not f.is_void))
+            non_void = [f for f in alive if not f.is_void]
+            ai_pct = round(100.0 * sum(1 for f in non_void if f.ai_origin) / max(1, len(non_void)), 1)
+            tier_counts = dict(Counter(f.size_tier for f in non_void))
             category_counts = dict(Counter(f.category for f in alive))
             return {
                 "tick": self.tick,
                 "max_ticks": self.cfg.max_ticks,
                 "epoch": self.epoch,
+                "act": self.act,
+                "virtual_hour": round(self.virtual_hour, 1),
                 "width": self.cfg.width,
                 "height": self.cfg.height,
+                "active_w": self.canvas.active_w,
+                "active_h": self.canvas.active_h,
+                "palette_tier": self.canvas.palette_tier,
+                "palette_size": len(self.canvas.allowed_colors),
                 "total_placements": self.logger.total_events,
                 "actual_tps": round(self.actual_tps, 1),
                 "pixels_per_sec": int(self.pixels_per_sec),
@@ -1881,15 +2294,18 @@ class SimulationEngine:
                 "free_agents": free_count,
                 "num_users": self.cfg.num_users,
                 "population": pop,
+                "ai_faction_pct": ai_pct,
                 "tier_counts": tier_counts,
                 "category_counts": category_counts,
                 "device": str(self.device),
                 "policy_name": self.policy_name,
                 "ollama_ready": self.ollama_ready,
+                "use_flux_art": self.cfg.use_flux_art,
                 "use_diffusion": self.cfg.use_diffusion,
                 "brain_status": self.brain_status,
-                "factions": [f.to_summary_dict() for f in alive],
-                "alliances": alliances,
-                "wars": wars,
+                "factions": [f.to_summary_dict() for f in alive[:200]],
+                "total_active_factions": len(alive),
+                "alliances": alliances[:250],
+                "wars": wars[:250],
                 "chronicle": self.logger.recent_chronicle[-60:][::-1],
             }

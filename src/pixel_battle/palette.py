@@ -58,6 +58,31 @@ COLOR_NAMES: list[str] = [name for name, _ in PALETTE_SPEC]
 COLOR_HEX: list[str] = [hx for _, hx in PALETTE_SPEC]
 NAME_TO_IDX: dict[str, int] = {name: i for i, (name, _) in enumerate(PALETTE_SPEC)}
 
+# Official r/place 2022 progressive palette unlock tiers:
+# Tier 1 (Day 1): 16 initial colors
+PALETTE_TIER_1_16: tuple[int, ...] = (
+    0, 1, 4, 5, 6, 8, 10, 14, 15, 16, 20, 21, 25, 27, 30, 31,
+)
+# Tier 2 (Day 2): 24 colors (+ dark_red, green, dark_teal, teal, indigo, periwinkle, pink, dark_gray)
+PALETTE_TIER_2_24: tuple[int, ...] = tuple(
+    sorted(set(PALETTE_TIER_1_16) | {3, 9, 11, 12, 17, 18, 24, 29})
+)
+# Tier 3 (Day 3): all 32 colors
+PALETTE_TIER_3_32: tuple[int, ...] = tuple(range(NUM_COLORS))
+# Tier 4 (Whiteout Finale): pure white only
+PALETTE_TIER_4_WHITEOUT: tuple[int, ...] = (WHITE_IDX,)
+
+
+def get_tier_colors(tier: int) -> tuple[int, ...]:
+    """Return the unlocked palette indices for r/place 2022 palette tier 1..4."""
+    if tier <= 1:
+        return PALETTE_TIER_1_16
+    if tier == 2:
+        return PALETTE_TIER_2_24
+    if tier == 3:
+        return PALETTE_TIER_3_32
+    return PALETTE_TIER_4_WHITEOUT
+
 
 def _hex_to_rgb(hx: str) -> tuple[int, int, int]:
     hx = hx.lstrip("#")
@@ -98,14 +123,45 @@ def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
 PALETTE_LAB: np.ndarray = _rgb_to_lab(PALETTE_RGB)  # [32, 3]
 
 
-def rgb_to_palette_indices(rgb: np.ndarray) -> np.ndarray:
-    """Map an [H, W, 3] uint8 RGB image to nearest 32-color palette indices via CIE-LAB."""
+def rgb_to_palette_indices(
+    rgb: np.ndarray,
+    allowed_colors: tuple[int, ...] | list[int] | None = None,
+) -> np.ndarray:
+    """Map an [H, W, 3] uint8 RGB image to nearest allowed palette indices via CIE-LAB."""
     lab = _rgb_to_lab(rgb)  # [H, W, 3]
-    diff = lab[..., None, :] - PALETTE_LAB[None, None, :, :]  # [H, W, 32, 3]
-    # Slightly boost chroma importance (a, b) so vibrant hues don't wash to gray
     weights = np.array([0.85, 1.15, 1.15], dtype=np.float32)
-    dist2 = np.sum((diff * weights) ** 2, axis=-1)  # [H, W, 32]
-    return np.argmin(dist2, axis=-1).astype(np.uint8)
+    if allowed_colors is None or len(allowed_colors) >= NUM_COLORS:
+        diff = lab[..., None, :] - PALETTE_LAB[None, None, :, :]
+        dist2 = np.sum((diff * weights) ** 2, axis=-1)
+        return np.argmin(dist2, axis=-1).astype(np.uint8)
+    allowed_arr = np.asarray(sorted(set(int(c) % NUM_COLORS for c in allowed_colors)), dtype=np.uint8)
+    sub_lab = PALETTE_LAB[allowed_arr]  # [K, 3]
+    diff = lab[..., None, :] - sub_lab[None, None, :, :]
+    dist2 = np.sum((diff * weights) ** 2, axis=-1)
+    nearest = np.argmin(dist2, axis=-1)
+    return allowed_arr[nearest]
+
+
+def remap_indices_to_allowed(
+    grid: np.ndarray,
+    allowed_colors: tuple[int, ...] | list[int] | None,
+) -> np.ndarray:
+    """Remap an int16/uint8 palette grid (preserving -1 transparency) into allowed_colors via CIE-LAB."""
+    if allowed_colors is None or len(allowed_colors) >= NUM_COLORS:
+        return grid
+    allowed_arr = np.asarray(sorted(set(int(c) % NUM_COLORS for c in allowed_colors)), dtype=np.int16)
+    if allowed_arr.size == 0:
+        return grid
+    # Precompute 32-entry lookup table
+    weights = np.array([0.85, 1.15, 1.15], dtype=np.float32)
+    diff = PALETTE_LAB[:, None, :] - PALETTE_LAB[allowed_arr][None, :, :]
+    dist2 = np.sum((diff * weights) ** 2, axis=-1)
+    lut = allowed_arr[np.argmin(dist2, axis=-1)]
+    out = grid.copy()
+    valid = out >= 0
+    if valid.any():
+        out[valid] = lut[np.clip(out[valid], 0, NUM_COLORS - 1)]
+    return out
 
 
 def palette_to_rgb(indices: np.ndarray) -> np.ndarray:

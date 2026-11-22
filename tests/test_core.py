@@ -412,3 +412,334 @@ def test_comic_strips_and_cartoon_memes() -> None:
         assert len(np.unique(bp[bp >= 0])) >= 2
 
     assert len(SPRITE_KEYS) >= 34
+
+
+# ------------------------------------------------------------------
+# Revision 2.0 Tests (1:1 Reddit r/place 2022 Scale & AI-First)
+# ------------------------------------------------------------------
+
+
+def test_four_act_palette_unlocks_and_masking() -> None:
+    """REQ-SIM-008 & REQ-SIM-016: enforce 16 -> 24 -> 32 -> Whiteout palette & viewport boundaries."""
+    from pixel_battle.palette import (
+        PALETTE_TIER_1_16,
+        PALETTE_TIER_2_24,
+        PALETTE_TIER_3_32,
+        PALETTE_TIER_4_WHITEOUT,
+        remap_indices_to_allowed,
+    )
+
+    assert len(PALETTE_TIER_1_16) == 16
+    assert len(PALETTE_TIER_2_24) == 24
+    assert len(PALETTE_TIER_3_32) == 32
+    assert PALETTE_TIER_4_WHITEOUT == (WHITE_IDX,)
+
+    # Verify remap_indices_to_allowed strictly maps every non-transparent color into allowed set
+    full_grid = np.arange(32, dtype=np.int16).reshape(4, 8)
+    remapped = remap_indices_to_allowed(full_grid, PALETTE_TIER_1_16)
+    assert set(int(v) for v in np.unique(remapped)).issubset(set(PALETTE_TIER_1_16))
+
+    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model_path = Path("models/reddit_citizen.pt")
+    policies_to_test: list[StochasticPolicy] = [
+        StochasticPolicy(num_users=600, width=128, height=128, base_cooldown=2, device=dev, seed=101)
+    ]
+    if model_path.exists():
+        from pixel_battle.policies.neural import NeuralRedditPolicy
+
+        policies_to_test.append(
+            NeuralRedditPolicy(model_path, num_users=600, width=128, height=128, base_cooldown=2, device=dev, seed=102)
+        )
+
+    for pol in policies_to_test:
+        canvas = CanvasState(128, 128, dev, active_w=64, active_h=64, palette_tier=1)
+        pol.active_w, pol.active_h = 64, 64
+        pol.pos_x = pol.pos_x % 64
+        pol.pos_y = pol.pos_y % 64
+
+        # Act 1: 64x64, 16 colors only
+        for t in range(1, 8):
+            b = pol.step(t, canvas, [], [])
+            assert int(b.xs.max().item()) < 64 and int(b.ys.max().item()) < 64
+            used_cols = set(int(c) for c in torch.unique(b.colors).detach().cpu().tolist())
+            assert used_cols.issubset(set(PALETTE_TIER_1_16)), f"Locked colors leaked in Act 1: {used_cols - set(PALETTE_TIER_1_16)}"
+            canvas.apply_placements(t, b.xs, b.ys, b.colors, b.factions)
+
+        # Act 2: 128x64, 24 colors only
+        canvas.expand_viewport(128, 64, 2)
+        for t in range(8, 14):
+            b = pol.step(t, canvas, [], [])
+            assert int(b.xs.max().item()) < 128 and int(b.ys.max().item()) < 64
+            used_cols = set(int(c) for c in torch.unique(b.colors).detach().cpu().tolist())
+            assert used_cols.issubset(set(PALETTE_TIER_2_24)), f"Locked colors leaked in Act 2: {used_cols - set(PALETTE_TIER_2_24)}"
+            canvas.apply_placements(t, b.xs, b.ys, b.colors, b.factions)
+
+        # Act 4: 128x128 Whiteout — 100% pure white only!
+        canvas.expand_viewport(128, 128, 4)
+        non_white_before = int((canvas.colors != WHITE_IDX).sum().item())
+        assert non_white_before > 50
+        for t in range(14, 24):
+            b = pol.step(t, canvas, [], [])
+            assert bool((b.colors == WHITE_IDX).all().item()), "Act 4 Whiteout placed a non-white pixel!"
+            canvas.apply_placements(t, b.xs, b.ys, b.colors, b.factions)
+        non_white_after = int((canvas.colors != WHITE_IDX).sum().item())
+        assert non_white_after < non_white_before, "Act 4 Whiteout did not erase colored pixels!"
+
+
+def test_timezone_diurnal_curves_and_flag_regions() -> None:
+    """REQ-SIM-015: verify smooth regional sleep/wake diurnal curves and national flag timezone bindings."""
+    from pixel_battle.factions import FLAG_TIMEZONES, TIMEZONE_PEAK_UTC, timezone_awake_factor
+
+    for tz in TIMEZONE_PEAK_UTC:
+        vals = [timezone_awake_factor(tz, float(h)) for h in range(24)]
+        assert min(vals) >= 0.21 and max(vals) <= 1.36
+        if tz != "GLOBAL":
+            assert max(vals) >= 1.30 and min(vals) <= 0.28
+
+    # Distinct regional prime times (Europe evening vs Americas evening vs Asia-Pacific evening)
+    assert timezone_awake_factor("EUROPE", 19.5) > 1.25
+    assert timezone_awake_factor("EUROPE", 7.5) < 0.35
+    assert timezone_awake_factor("ASIA_PACIFIC", 12.0) > 1.25
+    assert timezone_awake_factor("AMERICAS", 1.5) > 1.25
+
+    # National flags mapped to true timezones
+    assert FLAG_TIMEZONES["japan"] == "ASIA_PACIFIC"
+    assert FLAG_TIMEZONES["france"] == "EUROPE"
+    assert FLAG_TIMEZONES["usa"] == "AMERICAS"
+    assert FLAG_TIMEZONES["brazil"] == "LATAM"
+    for fl in NATIONAL_FLAGS:
+        assert fl.key in FLAG_TIMEZONES, f"Missing timezone mapping for flag '{fl.key}'"
+
+
+def test_reddit2022_population_calibration() -> None:
+    """REQ-SIM-014: verify 20% one-shot ratio and ~15.5 mean px/user for 10M users at 160M placements."""
+    dev = torch.device("cpu")
+    policy = StochasticPolicy(num_users=1000, width=64, height=64, base_cooldown=4, device=dev, seed=2022)
+    sample = policy._sample_click_budgets(100_000)
+    one_shot = float((sample == 1).to(torch.float32).mean().item())
+    mean_px = float(sample.to(torch.float32).mean().item())
+    assert 0.19 <= one_shot <= 0.21, f"Expected 20% ± 1% one-shot, got {one_shot:.4f}"
+    assert 13.0 <= mean_px <= 18.0, f"Expected ~15.5 mean clicks/user, got {mean_px:.2f}"
+
+
+def test_multilingual_cjk_and_unicode_typography() -> None:
+    """REQ-ART-014: verify crisp CJK & accented Unicode wordmark rendering inside allowed palette."""
+    from pixel_battle.art.typography import TypographyStyleSpec, composite_styled_text
+    from pixel_battle.palette import PALETTE_TIER_1_16, remap_indices_to_allowed
+
+    samples = ["像素", "日本", "한국", "¡VIVA!", "FRANÇAIS", "DEUTSCH", "TÜRKİYE"]
+    for txt in samples:
+        bp = np.full((34, 96), -1, dtype=np.int16)
+        spec = TypographyStyleSpec(
+            include_text=True,
+            text=txt,
+            font_style="block",
+            size_tier="large",
+            color_effect="solid",
+            border_effect="outline_1px",
+            layout="straight",
+            placement="center",
+            fill_color=YELLOW_IDX,
+            outline_color=BLACK_IDX,
+        )
+        out = remap_indices_to_allowed(composite_styled_text(bp, spec), PALETTE_TIER_1_16)
+        valid_px = int((out >= 0).sum())
+        assert valid_px >= 40, f"Multilingual wordmark '{txt}' rendered too few pixels ({valid_px})"
+        used = set(int(v) for v in np.unique(out[out >= 0]))
+        assert used.issubset(set(PALETTE_TIER_1_16))
+
+
+def test_sandboxed_llm_pixel_code_runner() -> None:
+    """REQ-ART-009: verify AST sandbox executes safe NumPy/math geometry code and blocks unsafe code."""
+    from pixel_battle.art.flux_art import run_sandboxed_pixel_code
+    from pixel_battle.palette import PALETTE_TIER_1_16
+
+    good_code = """```python
+import numpy as np
+import math
+
+def draw(grid, w, h):
+    cx, cy = w // 2, h // 2
+    for y in range(h):
+        for x in range(w):
+            r = math.hypot(x - cx, y - cy)
+            if 6 <= r <= 20:
+                grid[y, x] = 2 if int(r) % 2 == 0 else 6
+```"""
+    bp = run_sandboxed_pixel_code(good_code, 48, 48, allowed_colors=PALETTE_TIER_1_16)
+    assert bp is not None and bp.shape == (48, 48)
+    assert int((bp >= 0).sum()) > 200
+    assert set(int(v) for v in np.unique(bp[bp >= 0])).issubset(set(PALETTE_TIER_1_16))
+
+    bad_scripts = [
+        "import os\ndef draw(grid, w, h): os.system('echo pwned')",
+        "def draw(grid, w, h): open('/etc/passwd').read()",
+        "def draw(grid, w, h): ().__class__.__base__.__subclasses__()",
+        "def draw(grid, w, h): eval('1+1')",
+        "def draw(grid, w, h): __import__('subprocess')",
+    ]
+    for bad in bad_scripts:
+        assert run_sandboxed_pixel_code(bad, 32, 32) is None, f"Sandbox failed to block: {bad}"
+
+
+def test_four_act_engine_lifecycle_checkpoint_and_timelapse(tmp_path: Path) -> None:
+    """End-to-end 4-Act lifecycle: Act 1 -> Act 2 -> Act 3 -> final_peak.png -> Act 4 Whiteout + dynamic-camera MP4."""
+    from pixel_battle.config import SimConfig
+    from pixel_battle.engine import SimulationEngine
+    from pixel_battle.timelapse import render_timelapse
+
+    cfg = SimConfig(
+        width=256,
+        height=256,
+        num_users=1600,
+        base_cooldown=3,
+        max_ticks=80,
+        chaos_ticks=8,
+        discovery_interval=12,
+        epoch_interval=25,
+        flash_raid_interval_ticks=30,
+        max_active_factions=24,
+        checkpoint_interval=40,
+        enable_expansion=True,
+        enable_whiteout=True,
+        act2_progress=0.30,
+        act3_progress=0.60,
+        whiteout_progress=0.88,
+        use_flux_art=False,
+        use_flux_typography=False,
+        use_diffusion=False,
+        policy_mode="stochastic",
+        llm_url="http://127.0.0.1:9/v1",  # Offline deterministic fallback
+        device="cpu",
+        run_dir=tmp_path / "run_4act",
+        seed=77,
+    )
+    eng = SimulationEngine(cfg)
+    assert eng.act == 1 and (eng.canvas.active_w, eng.canvas.active_h) == (128, 128)
+    assert len(eng.canvas.allowed_colors) == 16
+
+    saw_acts: set[int] = {eng.act}
+    for t in range(1, cfg.max_ticks + 1):
+        eng.step_once()
+        saw_acts.add(eng.act)
+        if t in (10, 30, 52):
+            eng.run_pareidolia_discovery(max_new=3)
+        if t == 36:
+            eng.spawn_streamer_flash_raid()
+        if t == 45:
+            eng.run_geopolitical_epoch()
+
+    eng.save_checkpoint()
+    eng.logger.close()
+    eng.brain.close()
+
+    assert saw_acts == {1, 2, 3, 4}, f"Expected all 4 acts, saw {saw_acts}"
+    assert (cfg.run_dir / "final_peak.png").exists(), "Missing pre-whiteout final_peak.png!"
+    assert eng.canvas.is_whiteout and len(eng.canvas.allowed_colors) == 1
+
+    # Verify checkpoint reload restores Act 4 & faction metadata cleanly
+    eng2 = SimulationEngine(cfg, resume=True)
+    assert eng2.act == 4 and eng2.tick == cfg.max_ticks
+    assert len(eng2.factions) == len(eng.factions) and len(eng2.factions) >= 6
+    eng2.logger.close()
+    eng2.brain.close()
+
+    # Verify dynamic-camera timelapse renders cleanly from 4-act chronicle
+    mp4 = render_timelapse(
+        cfg.run_dir,
+        cfg.run_dir / "dyn_test.mp4",
+        fps=15,
+        duration_sec=2.0,
+        scale=1,
+        hold_end_sec=0.5,
+        show_hud=True,
+        dynamic_camera=True,
+    )
+    assert mp4.exists() and mp4.stat().st_size > 8_000
+
+
+def test_neural_policy_2000x2000_1200_factions_mps_benchmark() -> None:
+    """REQ-ML-008 & REQ-SYS-001: 1:1 r/place 2022 benchmark (2000x2000, 1,200 factions, 120k slots) >= 10,000 px/s on MPS."""
+    model_path = Path("models/reddit_citizen.pt")
+    if not model_path.exists():
+        return
+    from pixel_battle.policies.neural import NeuralRedditPolicy
+
+    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    canvas = CanvasState(2000, 2000, dev, active_w=2000, active_h=2000, palette_tier=3)
+    policy = NeuralRedditPolicy(
+        model_path,
+        num_users=120_000,
+        width=2000,
+        height=2000,
+        base_cooldown=14,
+        device=dev,
+        seed=2022,
+    )
+
+    factions: list[Faction] = []
+    for i in range(1200):
+        if i < 696:
+            w, h, tier = 24, 24, "micro"
+        elif i < 1020:
+            w, h, tier = 48, 36, "medium"
+        elif i < 1164:
+            w, h, tier = 84, 56, "macro"
+        else:
+            w, h, tier = 320, 10, "ribbon"
+        x0 = (i * 137) % (2000 - w)
+        y0 = (i * 193) % (2000 - h)
+        bp_np = np.full((h, w), (i % 30) + 1, dtype=np.int16)
+        bp_t = torch.from_numpy(bp_np).to(dev)
+        fac = Faction(
+            id=i,
+            name=f"R22_{i}",
+            theme="bench",
+            slogan="go",
+            art_mode="flux_art" if tier != "ribbon" else "ribbon",
+            art_prompt="bench",
+            primary_color=(i % 30) + 1,
+            secondary_color=YELLOW_IDX,
+            accent_color=WHITE_IDX,
+            x0=x0,
+            y0=y0,
+            w=w,
+            h=h,
+            blueprint=bp_t,
+            edge_weight=compute_edge_weights(bp_t),
+            created_tick=0,
+            size_tier=tier,
+            timezone_region=("AMERICAS", "EUROPE", "ASIA_PACIFIC", "LATAM", "GLOBAL")[i % 5],
+        )
+        factions.append(fac)
+        # Assign slots directly for fast deterministic benchmark setup
+        start_s = i * 80
+        policy.user_factions[start_s : start_s + 80] = i
+
+    # Verify bulk CPU-cached metrics update speed across all 1,200 factions
+    t_m = time.perf_counter()
+    update_faction_metrics(canvas, factions, policy.user_factions)
+    dt_m = (time.perf_counter() - t_m) * 1000.0
+    print(f"\n[BENCH METRICS 1200 FACTIONS] {dt_m:.1f} ms")
+    assert dt_m < 300.0, f"update_faction_metrics too slow for 1,200 factions: {dt_m:.1f} ms"
+
+    # Warmup 2 ticks then benchmark 12 ticks
+    for t in range(1, 3):
+        b = policy.step(t, canvas, factions, [])
+        canvas.apply_placements(t, b.xs, b.ys, b.colors, b.factions)
+    if dev.type == "mps":
+        torch.mps.synchronize()
+
+    t0 = time.perf_counter()
+    placed = 0
+    for t in range(3, 15):
+        b = policy.step(t, canvas, factions, [])
+        canvas.apply_placements(t, b.xs, b.ys, b.colors, b.factions)
+        placed += int(b.xs.numel())
+    if dev.type == "mps":
+        torch.mps.synchronize()
+    dt = time.perf_counter() - t0
+    pps = placed / max(1e-4, dt)
+    print(f"[BENCH 2000x2000 1200 FACTIONS 120K SLOTS] {placed:,} px in {dt:.2f}s => {pps:,.0f} px/s on {dev}")
+    if dev.type == "mps":
+        assert pps >= 10_000, f"Expected >= 10,000 px/s on 2000x2000 MPS, got {pps:,.0f}"

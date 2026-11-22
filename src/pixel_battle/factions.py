@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,41 @@ import numpy as np
 import torch
 
 from pixel_battle.palette import COLOR_HEX, NUM_COLORS
+
+# Peak UTC hour for evening prime time (~20:00 local) per Timezone Region
+TIMEZONE_PEAK_UTC: dict[str, float] = {
+    "EUROPE": 19.0,       # ~20:00-21:00 CET
+    "AMERICAS": 1.0,      # ~20:00 EST / 17:00 PST
+    "LATAM": 0.5,         # ~20:30 BRT / 18:30 CST
+    "ASIA_PACIFIC": 12.0, # ~20:00 CST/SGT / 21:00 JST
+    "GLOBAL": -1.0,       # Always evenly awake
+}
+
+FLAG_TIMEZONES: dict[str, str] = {
+    "germany": "EUROPE", "france": "EUROPE", "ukraine": "EUROPE", "italy": "EUROPE",
+    "uk": "EUROPE", "turkey": "EUROPE", "sweden": "EUROPE", "norway": "EUROPE",
+    "finland": "EUROPE", "denmark": "EUROPE", "switzerland": "EUROPE", "netherlands": "EUROPE",
+    "poland": "EUROPE", "ireland": "EUROPE", "spain": "EUROPE", "portugal": "EUROPE",
+    "greece": "EUROPE", "belgium": "EUROPE",
+    "usa": "AMERICAS", "canada": "AMERICAS",
+    "brazil": "LATAM", "mexico": "LATAM", "argentina": "LATAM", "guatemala": "LATAM",
+    "colombia": "LATAM", "chile": "LATAM",
+    "japan": "ASIA_PACIFIC", "south_korea": "ASIA_PACIFIC", "india": "ASIA_PACIFIC", "vietnam": "ASIA_PACIFIC",
+    "pride": "GLOBAL", "trans": "GLOBAL",
+}
+
+
+def timezone_awake_factor(timezone_region: str, virtual_hour_utc: float) -> float:
+    """Return diurnal activity multiplier in [0.22, 1.35] for a Timezone Region at a UTC hour."""
+    peak = TIMEZONE_PEAK_UTC.get(timezone_region.upper(), -1.0)
+    if peak < 0.0:
+        return 1.0
+    hour_mod = float(virtual_hour_utc) % 24.0
+    # Cosine wave: 1.0 at peak hour, -1.0 at peak+12h (local ~08:00/04:00 sleep trough)
+    phase = 2.0 * math.pi * ((hour_mod - peak) / 24.0)
+    wave = 0.5 * (1.0 + math.cos(phase))  # [0.0 .. 1.0]
+    # Steepen sleep trough slightly so 2am-6am local is genuinely vulnerable (~0.22x)
+    return 0.22 + 1.13 * (wave ** 1.25)
 
 
 def compute_edge_weights(blueprint: torch.Tensor) -> torch.Tensor:
@@ -68,6 +104,14 @@ class Faction:
     is_void: bool = False
     alive: bool = True
 
+    # Rev 2.0 Timezone, Multilingual, AI-origin, Streamer Flash-Raid & Burnout fields
+    timezone_region: str = "GLOBAL"   # "AMERICAS" | "EUROPE" | "ASIA_PACIFIC" | "LATAM" | "GLOBAL"
+    language: str = "en"              # "en" | "zh" | "es" | "fr" | "de" | "ja" | "ko" | "pt" | "tr"
+    ai_origin: bool = True            # True when invented/generated live by local AI
+    is_streamer_raid: bool = False
+    raid_end_tick: int = 0
+    burnout_rate: float = 1.0
+
     # Strategy & military state
     role_weights: dict[str, float] = field(
         default_factory=lambda: {"builder": 0.62, "defender": 0.25, "expander": 0.13}
@@ -81,6 +125,7 @@ class Faction:
 
     # Diplomacy
     allies: set[int] = field(default_factory=set)
+    ally_expiry: dict[int, int] = field(default_factory=dict)
     enemies: set[int] = field(default_factory=set)
     pending_ally_offers: set[int] = field(default_factory=set)
 
@@ -95,6 +140,10 @@ class Faction:
 
     # Short narrative memory
     memory: list[str] = field(default_factory=list)
+
+    # Cached CPU blueprint & silhouette halo coords for fast 1,200-faction updates without MPS stalls
+    _bp_cpu_cache: np.ndarray | None = field(default=None, repr=False)
+    _halo_xy_cache: torch.Tensor | None = field(default=None, repr=False)
 
     @property
     def x1(self) -> int:
@@ -126,6 +175,8 @@ class Faction:
             self.y0 = int(y0)
         self.h, self.w = int(bp_np.shape[0]), int(bp_np.shape[1])
         self.blueprint = torch.from_numpy(bp_np.astype(np.int16)).to(dev)
+        self._bp_cpu_cache = bp_np.astype(np.int16, copy=True)
+        self._halo_xy_cache = None
         self.edge_weight = compute_edge_weights(self.blueprint)
 
     def remember(self, note: str) -> None:
@@ -151,6 +202,10 @@ class Faction:
             "cx": round(self.cx, 1),
             "cy": round(self.cy, 1),
             "is_void": self.is_void,
+            "is_streamer_raid": self.is_streamer_raid,
+            "timezone_region": self.timezone_region,
+            "language": self.language,
+            "ai_origin": self.ai_origin,
             "alive": self.alive,
             "members": self.member_count,
             "integrity": round(self.integrity, 3),
