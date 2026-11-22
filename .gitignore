@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+runs/
+data/
+examples/rplace_2022_final.jpg
+models/reddit_citizen_v*.pt
+*.mp4
+*.bin
+.DS_Store
