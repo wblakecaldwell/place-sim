@@ -76,8 +76,10 @@ class CanvasState:
         ys_c = ys.clamp(0, self.active_h - 1)
         if self.palette_tier >= 4:
             new_u8 = torch.full_like(new_colors, WHITE_IDX, dtype=torch.uint8)
+        elif new_colors.dtype == torch.uint8:
+            new_u8 = new_colors.clamp(max=NUM_COLORS - 1)
         else:
-            new_u8 = new_colors.to(torch.uint8)
+            new_u8 = new_colors.clamp(0, NUM_COLORS - 1).to(torch.uint8)
         prev = self.colors[ys_c, xs_c]
         changed_bool = prev != new_u8
         changed = changed_bool.to(torch.float32)

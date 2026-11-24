@@ -84,6 +84,17 @@ class FluxPixelArtGenerator:
                 lora_paths=lora_paths,
                 lora_scales=lora_scales,
             )
+            # Pre-compile fixed 512x512 MLX Metal graph once during warmup so live sprites take ~6-10s
+            try:
+                _ = self._model.generate_image(
+                    seed=1,
+                    prompt="pixel art star icon on white background",
+                    num_inference_steps=1,
+                    width=512,
+                    height=512,
+                )
+            except Exception as warm_exc:
+                log.debug("MLX FLUX pre-compile pass skipped: %s", warm_exc)
             try:
                 mx.clear_cache()
             except Exception:
@@ -147,15 +158,9 @@ class FluxPixelArtGenerator:
         if self._failed:
             return None
 
-        ratio = target_w / max(1.0, float(target_h))
-        if ratio >= 1.65:
-            gen_w, gen_h = 640, 320
-        elif ratio >= 1.25:
-            gen_w, gen_h = 576, 384
-        elif ratio <= 0.72:
-            gen_w, gen_h = 384, 576
-        else:
-            gen_w, gen_h = 512, 512
+        # Always generate at a single compiled 512x512 MLX shape to avoid 45s Metal shader recompiles!
+        # Aspect ratio is preserved cleanly via centered aspect crop before quantization.
+        gen_w, gen_h = 512, 512
 
         color_clause = f"vivid {color_theme} palette, " if color_theme else "flat vivid saturated colors, "
         bg_clause = (
@@ -175,6 +180,21 @@ class FluxPixelArtGenerator:
 
         if pil_img is None:
             return None
+
+        # Aspect-ratio crop without squashing; for wide non-cutout frames (e.g. comic strips),
+        # avoid slicing across a mid-image horizontal panel gutter by cropping from the top panel row.
+        ratio = target_w / max(1.0, float(target_h))
+        if ratio > 1.15:
+            crop_h = max(64, int(round(pil_img.width / ratio)))
+            if (not strip_bg) and ratio >= 1.55:
+                top = 0
+            else:
+                top = max(0, (pil_img.height - crop_h) // 2)
+            pil_img = pil_img.crop((0, top, pil_img.width, min(pil_img.height, top + crop_h)))
+        elif ratio < 0.87:
+            crop_w = max(64, int(round(pil_img.height * ratio)))
+            left = max(0, (pil_img.width - crop_w) // 2)
+            pil_img = pil_img.crop((left, 0, min(pil_img.width, left + crop_w), pil_img.height))
         return _crisp_downsample_to_palette(
             pil_img,
             target_w=target_w,
@@ -255,6 +275,19 @@ def run_sandboxed_pixel_code(
         log.warning("Rejected unsafe LLM pixel-code script (%s).", reason)
         return None
 
+    from pixel_battle.palette import COLOR_NAMES
+
+    color_consts: dict[str, int] = {}
+    for idx, cname in enumerate(COLOR_NAMES):
+        key = cname.upper().replace(" ", "_").replace("-", "_")
+        color_consts[key] = idx
+    color_consts.setdefault("GOLD", 6)
+    color_consts.setdefault("CYAN", 14)
+    color_consts.setdefault("MAGENTA", 21)
+    color_consts.setdefault("VIOLET", 19)
+    color_consts.setdefault("GRAY", 28)
+    color_consts.setdefault("GREY", 28)
+
     grid = np.full((h, w), -1, dtype=np.int16)
     safe_globals = {
         "__builtins__": {
@@ -296,6 +329,7 @@ def run_sandboxed_pixel_code(
         "ceil": math.ceil,
         "exp": math.exp,
         "log": math.log,
+        **color_consts,
     }
     safe_locals: dict = {}
     try:

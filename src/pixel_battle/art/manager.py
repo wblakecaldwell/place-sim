@@ -232,25 +232,16 @@ class ArtManager:
         if art_mode == "void_monster":
             return remap_indices_to_allowed(generate_void_monster(w, h, seed=seed), allowed_colors), "none"
 
-        # 2. AI-First Visionless Geometric Chaos via LLM-written sandboxed code
+        # 2. AI-First Visionless Geometric Chaos via LLM-written sandboxed code (instant procedural/fractal fallback — never stalls on extra FLUX)
         if art_mode == "ai_code":
             bp_code: np.ndarray | None = None
             if ai_code:
                 bp_code = run_sandboxed_pixel_code(ai_code, w, h, allowed_colors=allowed_colors)
-            if bp_code is None and self.flux_art is not None:
-                with self._lock:
-                    bp_code = self.flux_art.generate_pixel_art(
-                        prompt=f"abstract geometric pixel art pattern, {prompt}, no characters, pure geometry",
-                        target_w=w,
-                        target_h=h,
-                        strip_bg=fluid_cutout,
-                        add_outline=False,
-                        allowed_colors=allowed_colors,
-                        color_theme=color_theme,
-                        seed=seed,
-                    )
             if bp_code is None or not self._is_valid_blueprint(bp_code, art_mode="fractal"):
-                bp_code = generate_fractal(("sierpinski", "mandelbrot", "carpet", "diamond")[seed % 4], w, h, seed=seed)
+                if seed % 2 == 0:
+                    bp_code = generate_fractal(("sierpinski", "mandelbrot", "carpet", "diamond")[seed % 4], w, h, seed=seed)
+                else:
+                    bp_code = generate_procedural(prompt, w, h, primary, secondary, accent, seed=seed)
             return remap_indices_to_allowed(bp_code, allowed_colors), "none"
 
         # 3. AI-First FLUX Pixel-Art LoRA (fluid cutouts, comics, streamer raids, paintings, pop culture)
@@ -451,7 +442,7 @@ class ArtManager:
         allowed_colors: tuple[int, ...] | list[int] | None = None,
     ) -> np.ndarray:
         """Add one clean organic die-cut fortify aura (never double-stamping text or framing comics/paintings)."""
-        if art_mode in ("clean_space", "painting", "ribbon", "micro_sprite", "comic_strip", "flux_comic"):
+        if art_mode in ("clean_space", "painting", "ribbon", "micro_sprite", "comic_strip", "flux_comic", "niche_badge"):
             return remap_indices_to_allowed(bp.copy(), allowed_colors)
         framed = add_silhouette_fortify(bp, primary % NUM_COLORS, secondary % NUM_COLORS, accent % NUM_COLORS)
         if (not already_stamped) and typography is not None and typography.include_text and max(bp.shape) >= 34:

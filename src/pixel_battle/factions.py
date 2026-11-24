@@ -108,6 +108,7 @@ class Faction:
     timezone_region: str = "GLOBAL"   # "AMERICAS" | "EUROPE" | "ASIA_PACIFIC" | "LATAM" | "GLOBAL"
     language: str = "en"              # "en" | "zh" | "es" | "fr" | "de" | "ja" | "ko" | "pt" | "tr"
     ai_origin: bool = True            # True when invented/generated live by local AI
+    created_vhour: float = 0.0        # Virtual clock hour when founded (for crowd-gated burnout)
     is_streamer_raid: bool = False
     raid_end_tick: int = 0
     burnout_rate: float = 1.0

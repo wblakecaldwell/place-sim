@@ -772,3 +772,172 @@ def test_macro_community_planner_profiles_and_export(tmp_path: Path) -> None:
 
     arts = export_plan_artifacts(tuned2k, tmp_path / "plan_out", render_mp4=True)
     assert arts["trace"].exists() and arts["mp4"].exists() and arts["mp4"].stat().st_size > 8_000
+
+
+def test_ytshort_preset_and_rev21_controls(tmp_path: Path) -> None:
+    """Verify fixed 540x960 ytshort preset, bubble stripping, natural rivals, autonomous wars, & ArtBank."""
+    import json
+    from pixel_battle.art.bank import ArtBank, strip_white_sticker_bubble
+    from pixel_battle.config import SimConfig, apply_preset
+    from pixel_battle.engine import SimulationEngine
+    from pixel_battle.planner import export_plan_artifacts, preset_ytshort, run_macro_plan
+    from pixel_battle.timelapse import render_timelapse
+
+    # 1. Preset defaults match Rev 2.3 fixed 360x640 -> 1080p (3x) / 4K (6x) deterministic YouTube Short spec
+    cfg_full = apply_preset(SimConfig(), "ytshort")
+    assert (cfg_full.width, cfg_full.height) == (360, 640)
+    assert cfg_full.enable_expansion is False
+    assert cfg_full.enable_whiteout is False
+    assert cfg_full.sync_mode is True
+    assert cfg_full.day0_factions == 150
+    assert cfg_full.target_total_factions == 440
+    assert cfg_full.targeted_chaos_only is False
+    assert cfg_full.no_generic_fallbacks is True
+
+    # 1b. Verify white sticker-bubble stripper removes outer black+white oval while preserving colored sprite
+    bub = np.full((36, 36), -1, dtype=np.int16)
+    yy, xx = np.ogrid[:36, :36]
+    oval = ((xx - 18) ** 2 + (yy - 18) ** 2) <= 15**2
+    bub[oval] = WHITE_IDX
+    # 1px black outer ring
+    bub[((xx - 18) ** 2 + (yy - 18) ** 2 <= 16**2) & (~oval)] = BLACK_IDX
+    # Colored 10x10 sprite core inside the white bubble
+    bub[13:23, 13:23] = 2  # Red core
+    cleaned_bub = strip_white_sticker_bubble(bub, allow_keep=False)
+    assert int((cleaned_bub == 2).sum()) == 100
+    assert int((cleaned_bub == WHITE_IDX).sum()) == 0
+    assert cleaned_bub.shape[0] <= 14 and cleaned_bub.shape[1] <= 14
+
+    # 2. Create a mini pre-forged ArtBank with curated natural rival pairs
+    bank_dir = tmp_path / "mini_bank"
+    (bank_dir / "blueprints").mkdir(parents=True)
+    manifest = []
+    for i in range(12):
+        bp = np.full((24, 24), (i % 12) + 2, dtype=np.int16)
+        bp[0, :] = -1
+        rel = f"blueprints/bp_{i:04d}.npy"
+        np.save(bank_dir / rel, bp)
+        manifest.append(
+            {
+                "id": i,
+                "name": f"BankArt_{i}",
+                "category": "anime",
+                "art_mode": "flux_art",
+                "size_tier": "micro" if i % 2 == 0 else "medium",
+                "aspect": "square",
+                "fluid_cutout": True,
+                "timezone_region": "GLOBAL",
+                "language": "en",
+                "slogan": f"Go {i}",
+                "art_prompt": f"sprite {i}",
+                "banner_text": f"B{i}",
+                "primary_color": (i % 12) + 2,
+                "secondary_color": YELLOW_IDX,
+                "accent_color": WHITE_IDX,
+                "w": 24,
+                "h": 24,
+                "blueprint_file": rel,
+            }
+        )
+    (bank_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    rivals = [
+        {"a": "BankArt_0", "b": "BankArt_1", "reason": "Coffee vs Tea"},
+        {"a": "BankArt_2", "b": "BankArt_3", "reason": "Cats vs Dogs"},
+    ]
+    (bank_dir / "rivals.json").write_text(json.dumps(rivals), encoding="utf-8")
+    bank_check = ArtBank(bank_dir, seed=7)
+    assert bank_check.remaining() == 12
+    assert len(bank_check.rival_map) == 4
+
+    # 3. Deterministic step-locked fixed-size 9:16 run (240x426 -> 3x = 720x1278)
+    cfg = SimConfig(
+        width=240,
+        height=426,
+        num_users=2400,
+        base_cooldown=3,
+        max_ticks=60,
+        chaos_ticks=1,
+        discovery_interval=10,
+        epoch_interval=25,
+        max_active_factions=80,
+        checkpoint_interval=40,
+        enable_expansion=False,
+        enable_whiteout=False,
+        sync_mode=True,
+        day0_factions=16,
+        target_total_factions=26,
+        factions_per_wave=3,
+        targeted_chaos_only=True,
+        no_generic_fallbacks=True,
+        art_bank_dir=bank_dir,
+        size_multiplier=0.85,
+        burnout_min_coverage=0.88,
+        burnout_age_vhours=36.0,
+        target_organized_share=0.84,
+        use_flux_art=False,
+        use_flux_typography=False,
+        use_diffusion=False,
+        policy_mode="stochastic",
+        llm_url="http://127.0.0.1:9/v1",
+        device="cpu",
+        run_dir=tmp_path / "run_ytshort_sync",
+        seed=2026,
+    )
+    eng = SimulationEngine(cfg)
+    assert (eng.canvas.active_w, eng.canvas.active_h) == (240, 426)
+
+    for _ in range(cfg.max_ticks):
+        eng.step_once()
+
+    eng.save_checkpoint()
+    eng.logger.close()
+    eng.brain.close()
+
+    # Verify Day-0 + deterministic target total reached, zero procedural shields, ZERO Python word banners (REQ-ART-018)
+    art_facs = [f for f in eng.factions if not f.is_void and not f.is_streamer_raid]
+    assert len(art_facs) >= 20, f"Expected >= 20 deterministic factions, got {len(art_facs)}"
+    assert all(f.art_mode != "procedural" for f in art_facs), "Generic procedural shield fallback leaked!"
+    assert all(f.art_mode not in ("banner", "niche_badge") for f in art_facs), "Python word-box/banner leaked!"
+    assert any(f.name.startswith("BankArt_") for f in art_facs), "ArtBank blueprints were not consumed!"
+    chron_lines = [
+        json.loads(line)
+        for line in (cfg.run_dir / "chronicle.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    war_events = [c for c in chron_lines if c.get("kind") == "war"]
+    assert len(war_events) >= 2, f"Expected natural rivalry & border wars, got {len(war_events)}"
+    assert any("NATURAL RIVALRY" in c.get("summary", "") for c in war_events), "Expected face-to-face NATURAL RIVALRY war event!"
+    # Verify corners/edges claimed early & active raiders stay capped <= 16 (REQ-SIM-021, REQ-DIP-012)
+    edge_facs = [f for f in art_facs if f.x0 == 0 or f.y0 == 0 or f.x1 >= 239 or f.y1 >= 425]
+    assert len(edge_facs) >= 4, f"Expected corners & edges claimed early, got {len(edge_facs)} edge factions"
+    assert sum(1 for f in art_facs if f.alive and f.raid_target_id is not None) <= 16
+    assert all(f.ribbon_axis in ("", "h", "v") for f in art_facs if f.art_mode == "ribbon")
+
+    # Verify untouched empty canvas stays pure white (targeted_chaos_only = True)
+    colors_np = eng.canvas.colors_numpy()
+    owner_np = eng.canvas.owner_numpy()
+    unowned_mask = owner_np < 0
+    if unowned_mask.any():
+        # Almost all unowned pixels must remain pure white (only stray griefers inside bbox can touch non-white)
+        white_frac_unowned = float((colors_np[unowned_mask] == WHITE_IDX).mean())
+        assert white_frac_unowned >= 0.90, f"Empty canvas polluted with noise! white_frac={white_frac_unowned:.3f}"
+
+    # Verify crisp 3x fixed 9:16 render (exact 720x1278)
+    mp4 = render_timelapse(
+        cfg.run_dir,
+        cfg.run_dir / "short_test.mp4",
+        fps=15,
+        duration_sec=2.0,
+        scale=3,
+        hold_end_sec=0.5,
+        show_hud=False,
+        dynamic_camera=False,
+    )
+    assert mp4.exists() and mp4.stat().st_size > 8_000
+
+    # 4. Macro planner ytshort profile + vertical storyboard MP4
+    p_res = run_macro_plan(preset_ytshort(), steps=96)
+    ps = p_res.summary_dict()
+    assert ps["peak_cov_overall_pct"] >= 75.0
+    p_arts = export_plan_artifacts(p_res, tmp_path / "plan_ytshort", render_mp4=True)
+    assert p_arts["mp4"].exists() and p_arts["mp4"].stat().st_size > 8_000

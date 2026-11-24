@@ -2,7 +2,7 @@
 
 **Document Standard:** ASD-STE100 (Simplified Technical English)
 **Project:** `place-sim` (`pixel-battle`)
-**Revision:** 2.0
+**Revision:** 2.2
 
 ---
 
@@ -22,13 +22,16 @@ Use these exact Technical Names in this specification and in related project doc
 | Technical Name | Definition |
 | :--- | :--- |
 | **Active Viewport** | The unlocked rectangle (`active_w x active_h`) of the Canvas where Citizens can place pixels. |
+| **Art Bank** | A local folder of pre-forged unique Blueprint files and metadata that a simulation loads during a run. |
 | **Black Hole** | A circular Void anomaly with a dark core, spiral bands, and dark tendrils. |
 | **Blueprint** | A 2D target grid of palette indices (`0` to `31`) or transparent cells (`-1`) for one Faction. |
 | **Canvas** | The live 2D pixel grid that Citizens change on each Tick. |
+| **Chaos Squad** | A small temporary group of `30` to `150` unorganized Citizens that attack a tight patch inside active Faction art. |
 | **Chronicle** | The append-only JSON Lines file (`chronicle.jsonl`) that records Faction and diplomacy events. |
 | **Citizen** | One simulated user with a position, a cooldown timer, a loyalty value, and a Faction assignment. |
 | **Comic Strip** | A multi-panel pixel Blueprint with black panel borders, white gutters, cartoon figures, and speech bubbles. |
 | **Cutout** | A non-rectangular Blueprint whose outer background cells have the transparent value (`-1`). |
+| **Day-0 Launch Wave** | A batch of prepped Factions that spawn during Ticks `1` to `50` to simulate an organized land rush. |
 | **Empty-Space Faction** | A small Faction whose Blueprint sets pixels to pure white (`0`) to defend blank area. |
 | **Epoch** | One strategy cycle in which active Faction leaders examine the Canvas and select actions. |
 | **Event Log** | The append-only binary file (`events.bin`) that stores every pixel placement. |
@@ -43,6 +46,7 @@ Use these exact Technical Names in this specification and in related project doc
 | **Medium Faction** | A mid-size Faction whose Blueprint spans `30` to `59` pixels on its longer side. |
 | **Micro Faction** | A small Faction whose Blueprint spans `12` to `29` pixels on its longer side. |
 | **National Flag** | A Blueprint that represents a country flag with accurate stripe and emblem geometry. |
+| **Natural Rival Pair** | Two visually or culturally matched Factions that spawn side-by-side on a shared seam and contest territory. |
 | **One-Shot Citizen** | A Citizen that places `1` pixel during its session and then leaves the Canvas. |
 | **Pareidolia** | The process in which a vision model examines an unclaimed pixel cluster and founds a Faction. |
 | **Policy** | The GPU module that computes pixel placements for ready Citizens on each Tick. |
@@ -65,8 +69,11 @@ Use these exact Technical Names in this specification and in related project doc
 | **REQ-SYS-003** | The CLI must accept a Tick limit (`--max-ticks`), a wall-clock hour limit (`--max-hours`), and a scale preset (`--preset`). | Run with `--max-hours 0.04`. Make sure that the process stops normally at the target time. | Implemented |
 | **REQ-SYS-004** | The engine must save Canvas, Blueprint, and Faction checkpoints at each checkpoint interval and on `SIGINT`. | Stop a live run with `SIGINT`. Resume with `--resume` and make sure that Tick numbers continue in sequence. | Implemented |
 | **REQ-SYS-005** | The batch script must prevent macOS idle sleep with `caffeinate -i` and release unused MPS and MLX memory at intervals. | Run unattended for 6 hours or more. Make sure that Tick counts increase without pause. | Implemented |
-| **REQ-SYS-006** | The GPU Tick loop must run continuously without pause while background AI concept creation and art generation execute. | Run a discovery wave with live FLUX art. Make sure that GPU placements continue during model calls. | Verified |
+| **REQ-SYS-006** | In interactive live-viewer mode, the GPU Tick loop must continue while background AI concept creation and art generation execute. | Run the live web viewer with FLUX art active. Make sure that GPU placements continue during model calls. | Verified |
 | **REQ-SYS-007** | The local AI client must support OpenAI-compatible endpoints (`LM Studio` and `Ollama`) and read tokens from macOS Keychain (`place-sim`) or `LMSTUDIO_API_KEY`. | Store a token in Keychain and call the local server. Make sure that zero secrets exist in repo files. | Verified |
+| **REQ-SYS-008** | In deterministic step-locked mode (`--sync`), the engine must finish all scheduled AI concepts, Blueprints, and Epoch turns before it advances to the next Tick. | Run with `--sync` and inspect `chronicle.jsonl`. Make sure that slow model calls delay wall-clock time without skipped Factions. | Verified |
+| **REQ-SYS-009** | The CLI must include a fast macro planner (`pixel-battle plan`) that simulates multi-hour Faction pacing and exports a preview MP4 in less than 3 seconds. | Run `test_macro_community_planner_profiles_and_export()`. Make sure that 3 plans complete in under 3 seconds. | Verified |
+| **REQ-SYS-010** | Tracked repository code, comments, and documents must not contain personal names, personal email addresses, or authentication secrets. | Search tracked files before commit. Make sure that zero secrets or personal identifiers appear. | Verified |
 
 ---
 
@@ -90,7 +97,11 @@ Use these exact Technical Names in this specification and in related project doc
 | **REQ-SIM-014** | Each GPU Citizen slot must track a unique `user_id` and click budget, then cycle to a new `user_id` at zero. | Count placements for each `user_id` in `events.bin`. Make sure that finished sessions match target click tiers. | Verified |
 | **REQ-SIM-015** | Community theme selection must sample active non-NSFW subreddits and international cultures with a profanity filter active. | Examine 40 founded Factions. Make sure that zero profanity and zero duplicate names appear. | Verified |
 | **REQ-SIM-016** | The engine must advance a 72-hour virtual clock across the run and apply diurnal sleep-wake multipliers (`0.22x` to `1.35x`) to each Timezone Region. | Run a unit test across 24 virtual hours. Make sure that `EUROPE`, `AMERICAS`, and `ASIA_PACIFIC` peak at offset hours. | Verified |
-| **REQ-SIM-017** | Factions must lose Hype through burnout after peak age. Alliances must cap at `<= 3` partners with timed expiry for territory turnover. | Examine `chronicle.jsonl` across Acts 1 to 3. Make sure that old Factions burn out and new Factions replace them. | Implemented |
+| **REQ-SIM-017** | Factions must lose Hype through burnout after peak age when Canvas coverage meets the configured burnout coverage gate. Alliances must cap at `<= 3` partners with timed expiry. | Examine `chronicle.jsonl` across a full run. Make sure that burnout stays inactive below the coverage gate. | Implemented |
+| **REQ-SIM-018** | In targeted-chaos mode, unorganized Citizens must not paint random noise onto untouched white space. They must attack active Factions through random vandalism and Chaos Squads. | Inspect Canvas snapshots during early and mid Ticks. Make sure that unclaimed area stays pure white while active art shows repair fights. | Verified |
+| **REQ-SIM-019** | The engine must support a Day-0 Launch Wave that spawns prepped Factions during Ticks `1` to `50` for an immediate land rush. | Run with `--day0-factions 40`. Make sure that at least 40 Factions exist by Tick `50`. | Verified |
+| **REQ-SIM-020** | The engine must allow fixed-size runs (`--no-expansion`), optional Whiteout disable (`--no-whiteout`), and palette unlocks independent of Canvas resizing. | Start a run with `--no-expansion --no-whiteout`. Make sure that Active Viewport dimensions stay constant and Whiteout never triggers. | Verified |
+| **REQ-SIM-021** | Early Day-0 Launch Wave Factions must claim the 4 Active Viewport corners and 4 walls flush first, then pack interior space within the first `8%` of run Ticks. | Inspect Canvas snapshots at `10%` of run Ticks. Make sure that all 4 corners, all 4 edges, and `>= 75%` of Canvas area contain art. | Verified |
 
 ---
 
@@ -123,6 +134,8 @@ Use these exact Technical Names in this specification and in related project doc
 | **REQ-DIP-008** | Regional Flash-Raids must trigger during prime-time windows, mobilize `3,000` to `8,000` temporary Citizens onto established territory, and disperse after `250` to `450` Ticks. | Run a Flash-Raid test and inspect `chronicle.jsonl`. Make sure that raiders stamp the mural and then disperse. | Verified |
 | **REQ-DIP-009** | Transverse Ribbon Factions must advance their stripe tip across the Active Viewport, cut through rivals, and yield to allied art. | Examine timelapse frames of a Transverse Ribbon. Make sure that the stripe grows across the Canvas. | Implemented |
 | **REQ-DIP-010** | The Void subsystem must rotate across Tendril Void, Black Hole, Fractal, and Void Monster variants so dark events vary across long runs. | Examine `chronicle.jsonl` and snapshots across a multi-hour run. Make sure that multiple Void variants appear. | Implemented |
+| **REQ-DIP-011** | Natural Rival Pairs must spawn face-to-face on a shared seam and contest opaque rival pixels along the shared border instead of random bounding-box scatter. | Inspect timelapse frames of Natural Rival Pairs. Make sure that border clashes advance cleanly without speckle static. | Verified |
+| **REQ-DIP-012** | Concurrent active wars must stay capped (`<= 20`) while autonomous Epochs run gap-closing `EXPAND` and `FORTIFY` actions to eliminate dead white cracks. | Audit `chronicle.jsonl` and mid-run snapshots. Make sure that artworks stay crisp and shoulder tightly together. | Verified |
 
 ---
 
@@ -144,6 +157,10 @@ Use these exact Technical Names in this specification and in related project doc
 | **REQ-ART-012** | The art engine must generate horizontal, vertical, and diagonal Transverse Ribbon Blueprints that tile cleanly across the Active Viewport. | Generate horizontal, vertical, and diagonal Transverse Ribbons. Make sure that patterns tile cleanly across all pixels. | Verified |
 | **REQ-ART-013** | The art engine must generate Black Hole Blueprints, Fractal Blueprints, and Void Monster faces for Void eruptions. | Generate preview PNGs of Black Holes, Fractals, and Void Monsters. Make sure that geometry stays sharp. | Verified |
 | **REQ-ART-014** | The engine must provide an option for sparse `4 x 5` pixel mini-crewmate cameos inside wide solid regions with no overwrite of fine details. | Inspect cameo placements in a mature run. Make sure that mini cameos remain tiny and sparse. | Implemented |
+| **REQ-ART-015** | When generic fallbacks are disabled (`--no-generic-fallbacks`), the engine must not spawn generic procedural shields or repeat any Flag, Fractal, Comic Strip, Cartoon Meme, Painting, or Micro Sprite more than once per run. | Audit `chronicle.jsonl` after `>= 200` Factions form. Make sure that zero generic shields and zero duplicate template keys exist. | Verified |
+| **REQ-ART-016** | The CLI must support decoupled Art Bank creation (`pixel-battle forge-bank`) so Qwen3-VL and MLX FLUX run sequentially without GPU memory contention. | Run `pixel-battle forge-bank` and inspect `manifest.json`. Make sure that every saved Blueprint passes palette and validity checks. | Verified |
+| **REQ-ART-017** | Cutout background removal must strip exterior white oval halos tightly to colored art contours and retain at most `2%` rounded sticker backgrounds. | Inspect Art Bank sprites and run `test_ytshort_preset_and_rev21_controls()`. Make sure that outer white bubbles are removed. | Verified |
+| **REQ-ART-018** | In AI-art mode (`--no-generic-fallbacks`), Python code must not render templated word boxes, generic geometric tiles, or bitmap text banners. Any text art must originate from local AI image generation. | Audit `chronicle.jsonl` and `state.json` after a full run. Make sure that zero Python `banner` or templated word-box Factions appear. | Verified |
 
 ---
 
@@ -172,6 +189,7 @@ Use these exact Technical Names in this specification and in related project doc
 | **REQ-VID-003** | The renderer must accept a time-curve exponent (`--curve`, default `1.35` to `1.45`) so early chaos and expansion rushes get clear visible duration. | Render a multi-act run with `--curve 1.45`. Make sure that early, expansion, and finale phases show balanced speed. | Implemented |
 | **REQ-VID-004** | Event Log Version 2 must keep read compatibility with Version 1 (`12`-byte) logs. | Read a Version 1 Event Log with `mmap_events()`. Make sure that all fields match original values. | Verified |
 | **REQ-VID-005** | The renderer must support dynamic camera pull-back across `expand_canvas` milestones (`1000 x 1000` -> `2000 x 1000` -> `2000 x 2000`) and Whiteout Finale playback. | Render a 4-act test run with `--dynamic-camera`. Make sure that the camera expands smoothly at Act 2 and Act 3. | Verified |
+| **REQ-VID-006** | The renderer must support fixed 9:16 vertical exports (`360 x 640` at `6x`, `540 x 960` at `4x`, or `720 x 1280` at `3x`) to exact 4K (`2160 x 3840`) `60 fps` MP4. | Render a `360 x 640` run with `--scale 6 --no-hud`. Make sure that `ffprobe` reports `2160 x 3840` at `60 fps`. | Verified |
 
 ---
 

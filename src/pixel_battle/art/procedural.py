@@ -252,11 +252,10 @@ def stamp_nameplate_ribbon(
 
 
 def add_silhouette_fortify(bp: np.ndarray, primary: int, secondary: int, accent: int) -> np.ndarray:
-    """Fortify a blueprint organically: die-cut silhouette aura for cutouts, ornate frame only for solid rectangles."""
-    # When >= 12% pixels are transparent, outline the curved silhouette directly
+    """Fortify a blueprint cleanly: 1px solid colored aura + 1px black contour (zero checkerboard noise)."""
+    # When >= 12% pixels are transparent, outline the curved silhouette cleanly
     if float((bp < 0).mean()) >= 0.12:
         out = bp.copy()
-        h, w = out.shape
         valid = out >= 0
 
         def _dilate4(m: np.ndarray) -> np.ndarray:
@@ -269,12 +268,8 @@ def add_silhouette_fortify(bp: np.ndarray, primary: int, secondary: int, accent:
 
         ring1 = _dilate4(valid) & (~valid)
         ring2 = _dilate4(valid | ring1) & (~(valid | ring1))
-        ring3 = _dilate4(valid | ring1 | ring2) & (~(valid | ring1 | ring2))
-        yy, xx = np.mgrid[0:h, 0:w]
-        checker = ((xx + yy) % 2) == 0
-        out[ring1] = np.where(checker[ring1], primary % NUM_COLORS, secondary % NUM_COLORS)
-        out[ring2] = np.where(checker[ring2], secondary % NUM_COLORS, accent % NUM_COLORS)
-        out[ring3] = BLACK_IDX
+        out[ring1] = primary % NUM_COLORS
+        out[ring2] = BLACK_IDX
         return out
     return add_ornate_border(bp, primary, secondary, accent)
 

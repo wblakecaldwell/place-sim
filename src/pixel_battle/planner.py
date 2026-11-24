@@ -213,6 +213,24 @@ def preset_tuned_2000() -> MacroPlanConfig:
     )
 
 
+def preset_ytshort() -> MacroPlanConfig:
+    """Rev 2.1 9:16 YouTube Short plan (1080x1920 native -> 4K 2160x3840 @ 60fps)."""
+    return MacroPlanConfig(
+        width=1080,
+        height=1920,
+        hours=6.0,
+        online_slots=90_000,
+        max_active_factions=1200,
+        factions_per_sim_min=3.7,
+        size_multiplier=0.95,
+        burnout_min_coverage=0.60,
+        burnout_age_vhours=24.0,
+        land_rush_target_cov=0.70,
+        target_organized_share=0.80,
+        free_agent_clustering=0.24,
+    )
+
+
 def run_macro_plan(cfg: MacroPlanConfig, steps: int = 144) -> MacroPlanResult:
     """Execute a complete 72-virtual-hour macro community simulation on a coarse occupancy grid."""
     rng = random.Random(cfg.seed)
@@ -528,7 +546,16 @@ def _render_plan_mp4(result: MacroPlanResult, out_path: Path, size: int = 720, f
     cfg = result.config
     W, H = cfg.width, cfg.height
     hud_h = 48
-    out_w, out_h = size, size + hud_h
+    if H > W:
+        # Vertical 9:16 storyboard preview
+        canvas_w = int(round(size * (W / float(H))))
+        canvas_w += canvas_w % 2
+        canvas_h = size + (size % 2)
+    else:
+        canvas_w = size + (size % 2)
+        canvas_h = int(round(size * (H / float(W))))
+        canvas_h += canvas_h % 2
+    out_w, out_h = canvas_w, canvas_h + hud_h
 
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -545,11 +572,11 @@ def _render_plan_mp4(result: MacroPlanResult, out_path: Path, size: int = 720, f
             draw = ImageDraw.Draw(img)
 
             # Dynamic camera viewport scaling
-            scale = min(size / float(m.active_w), size / float(m.active_h))
+            scale = min(canvas_w / float(m.active_w), canvas_h / float(m.active_h))
             fw = int(round(m.active_w * scale))
             fh = int(round(m.active_h * scale))
-            ox = (size - fw) // 2
-            oy = (size - fh) // 2
+            ox = (canvas_w - fw) // 2
+            oy = (canvas_h - fh) // 2
 
             # Background base (whiteout fade in Act 4, subtle clustered tone otherwise)
             bg = (245, 247, 250) if m.act == 4 else (24, 30, 44)
@@ -572,15 +599,15 @@ def _render_plan_mp4(result: MacroPlanResult, out_path: Path, size: int = 720, f
                         draw.rectangle([x0, y0, x1, y1], fill=col, outline=(10, 12, 18))
 
             # HUD footer
-            draw.rectangle([0, size, out_w, out_h], fill=(15, 20, 30))
+            draw.rectangle([0, canvas_h, out_w, out_h], fill=(15, 20, 30))
             draw.text(
-                (12, size + 6),
-                f"ACT {m.act} ({m.active_w}x{m.active_h}, {m.palette_size}c) | Hr {m.vhour:4.1f}/72 | {m.alive_factions} fac | Cov {m.cov_overall*100:4.1f}% (S:{m.cov_act3*100:4.1f}%)",
+                (10, canvas_h + 6),
+                f"ACT {m.act} ({m.active_w}x{m.active_h}, {m.palette_size}c) | Hr {m.vhour:4.1f}/72 | {m.alive_factions} fac | Cov {m.cov_overall*100:4.1f}%",
                 fill=(56, 189, 248),
             )
             draw.text(
-                (12, size + 26),
-                f"Organized Citizens: {m.organized_pct*100:4.1f}% | Free Agents: {m.free_agent_pct*100:4.1f}% | Est: {m.est_pixels_m:.0f}M px / {m.est_users_m:.1f}M users",
+                (10, canvas_h + 26),
+                f"Org {m.organized_pct*100:4.1f}% | Free {m.free_agent_pct*100:4.1f}% | S:{m.cov_act3*100:4.1f}% | {m.est_pixels_m:.0f}M px",
                 fill=(226, 232, 240),
             )
             proc.stdin.write(np.asarray(img, dtype=np.uint8).tobytes())

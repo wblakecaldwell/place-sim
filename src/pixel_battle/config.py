@@ -31,6 +31,24 @@ class SimConfig:
     flash_raid_interval_ticks: int = 750
     enable_burnout: bool = True
 
+    # Rev 2.1 Community Planning Controls (defaults preserve legacy behavior unless set / preset)
+    spawn_rate_per_min: float = 0.0        # If > 0, pace discovery waves to track factions/wall-clock min
+    size_multiplier: float = 1.0           # Artwork dimension scale multiplier
+    burnout_min_coverage: float = 0.0      # Crowd-gated burnout (0.0 = always retire old art; 0.60 = only >= 60%)
+    burnout_age_vhours: float = 24.0       # Virtual hours before crowd-gated burnout decay begins
+    land_rush_target_cov: float = 0.0      # If > 0, keep preferring newly opened wing until coverage reaches target
+    target_organized_share: float = 0.80   # Target share of online citizen slots inside active factions (0..0.95)
+    free_agent_clustering: float = 0.65    # 0.0 = rainbow confetti; 0.90+ = calm corner blobs
+
+    # Rev 2.2 Deterministic Step-Locked & Clean-Canvas Controls
+    sync_mode: bool = False                # True = step-locked deterministic ticks (finish all work before tick+1)
+    day0_factions: int = 0                 # Prepped Day-0 Launch Wave spawned across Ticks 1..45
+    target_total_factions: int = 0         # Exact total factions to spawn across the run (in sync_mode)
+    factions_per_wave: int = 4             # Factions spawned per discovery wave (in sync_mode)
+    targeted_chaos_only: bool = False      # True = pure white empty space; chaotic players attack active art only
+    no_generic_fallbacks: bool = False     # True = zero procedural shield spam & <= 1 copy ever of each template
+    art_bank_dir: Path | None = None       # Optional pre-forged Art Bank directory (decoupled Qwen3-VL -> FLUX)
+
     # Simulation horizon & pacing
     max_ticks: int = 8_000          # Placement horizon (or overridden by max_hours)
     max_hours: float = 0.0          # If > 0, run for this many wall-clock hours cleanly
@@ -85,10 +103,46 @@ class SimConfig:
 
 
 def apply_preset(cfg: SimConfig, preset: str) -> SimConfig:
-    """Apply a named scale preset ('standard', 'large', 'reddit2022') to SimConfig."""
+    """Apply a named scale preset ('standard', 'large', 'reddit2022', 'ytshort') to SimConfig."""
     p = preset.strip().lower()
     cfg.preset = p
-    if p == "reddit2022":
+    if p in ("ytshort", "short", "youtube_short"):
+        # Fixed 9:16 360x640 canvas (230k px — exact 9:16 twin of 512x512; 6x -> 4K 2160x3840 & 3x -> 1080p 1080x1920)
+        # Corners/edges + bold landmarks first, Niche-Carvers seal every white pocket, focused rival wars, no whiteout
+        cfg.preset = "ytshort"
+        cfg.width = 360
+        cfg.height = 640
+        cfg.num_users = 72_000
+        cfg.base_cooldown = 16
+        cfg.max_ticks = 10_000
+        cfg.max_hours = 0.0
+        cfg.max_active_factions = 300
+        cfg.chaos_ticks = 1
+        cfg.discovery_interval = 20
+        cfg.epoch_interval = 160
+        cfg.checkpoint_interval = 500
+        cfg.void_min_tick = 700
+        cfg.flash_raid_interval_ticks = 720
+        cfg.enable_expansion = False
+        cfg.enable_whiteout = False
+        cfg.enable_timezones = True
+        cfg.enable_flash_raids = True
+        cfg.enable_burnout = True
+        # Deterministic Rev 2.3 controls: Hour-1 full pack + AI visual niche-hunters + white-claiming chaos
+        cfg.sync_mode = True
+        cfg.day0_factions = 150
+        cfg.target_total_factions = 440
+        cfg.factions_per_wave = 8
+        cfg.targeted_chaos_only = False
+        cfg.no_generic_fallbacks = True
+        cfg.spawn_rate_per_min = 0.0
+        cfg.size_multiplier = 1.0
+        cfg.burnout_min_coverage = 0.90
+        cfg.burnout_age_vhours = 44.0
+        cfg.land_rush_target_cov = 0.0
+        cfg.target_organized_share = 0.86
+        cfg.free_agent_clustering = 0.36
+    elif p == "reddit2022":
         # Exact 1:1 Reddit r/place 2022 canvas (1000x1000 -> 2000x1000 -> 2000x2000 -> Whiteout)
         # 120k online slots cycling ~15.5 px/user reaches ~10M unique users & 2M 1-shot over 6-8h.
         cfg.width = 2000

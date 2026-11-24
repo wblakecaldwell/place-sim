@@ -48,8 +48,37 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.epoch_interval = args.epoch_interval
     if args.flash_raid_interval is not None:
         cfg.flash_raid_interval_ticks = args.flash_raid_interval
+    if args.spawn_rate is not None:
+        cfg.spawn_rate_per_min = args.spawn_rate
+    if args.size_mult is not None:
+        cfg.size_multiplier = args.size_mult
+    if args.burnout_cov is not None:
+        cfg.burnout_min_coverage = args.burnout_cov
+    if args.burnout_age_vhours is not None:
+        cfg.burnout_age_vhours = args.burnout_age_vhours
+    if args.land_rush_cov is not None:
+        cfg.land_rush_target_cov = args.land_rush_cov
+    if args.organized_target is not None:
+        cfg.target_organized_share = args.organized_target
+    if args.bg_cohesion is not None:
+        cfg.free_agent_clustering = args.bg_cohesion
+    if args.max_ticks is not None:
+        cfg.max_ticks = args.max_ticks
+    if args.sync:
+        cfg.sync_mode = True
+    if args.day0_factions is not None:
+        cfg.day0_factions = args.day0_factions
+    if args.target_factions is not None:
+        cfg.target_total_factions = args.target_factions
+    if args.factions_per_wave is not None:
+        cfg.factions_per_wave = args.factions_per_wave
+    if args.targeted_chaos:
+        cfg.targeted_chaos_only = True
+    if args.no_generic_fallbacks:
+        cfg.no_generic_fallbacks = True
+    if args.art_bank is not None:
+        cfg.art_bank_dir = Path(args.art_bank)
 
-    cfg.max_ticks = args.max_ticks
     cfg.max_hours = args.max_hours
     cfg.target_tps = args.tps
     cfg.llm_url = args.llm_url or args.ollama_url or cfg.llm_url
@@ -60,11 +89,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     cfg.use_flux_art = not args.no_flux_art
     cfg.use_flux_typography = not args.no_flux_typography
     cfg.use_diffusion = args.use_diffusion
-    cfg.enable_expansion = not args.no_expansion
-    cfg.enable_whiteout = not args.no_whiteout
-    cfg.enable_timezones = not args.no_timezones
-    cfg.enable_flash_raids = not args.no_flash_raids
-    cfg.enable_burnout = not args.no_burnout
+    if args.no_expansion:
+        cfg.enable_expansion = False
+    if args.no_whiteout:
+        cfg.enable_whiteout = False
+    if args.no_timezones:
+        cfg.enable_timezones = False
+    if args.no_flash_raids:
+        cfg.enable_flash_raids = False
+    if args.no_burnout:
+        cfg.enable_burnout = False
     cfg.policy_mode = args.policy
     cfg.neural_model_path = Path(args.neural_model)
     cfg.device = args.device
@@ -83,8 +117,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             pass
 
     if (cfg.use_flux_art or cfg.use_diffusion) and (args.warmup_flux or args.warmup_diffusion):
-        print("Warming up local MLX FLUX.1-schnell + Pixel-Art LoRA...")
+        print("Warming up local MLX FLUX.1-schnell + Pixel-Art LoRA (and priming first AI faction batch)...")
         engine.art.warmup()
+        if engine.ollama_ready and len(engine._idea_queue) == 0:
+            engine._refill_ai_idea_queue([], engine.canvas.allowed_colors)
 
     engine.start()
     print(f"\nPixel Battle ({cfg.preset}) running in: {run_dir}")
@@ -92,6 +128,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         f"Canvas: {engine.canvas.active_w}x{engine.canvas.active_h} -> {cfg.width}x{cfg.height} "
         f"(palette={len(engine.canvas.allowed_colors)}c, 4-act={'ON' if cfg.enable_expansion else 'OFF'}) | "
         f"Online Slots: {cfg.num_users:,} | Max Factions: {cfg.max_active_factions:,}"
+    )
+    print(
+        f"Tuning: mode={'SYNC' if cfg.sync_mode else 'async'} | day0={cfg.day0_factions} | "
+        f"target_fac={cfg.target_total_factions or 'unbounded'} | size={cfg.size_multiplier:.2f}x | "
+        f"burnout_gate={cfg.burnout_min_coverage*100:.0f}% | organized={cfg.target_organized_share*100:.0f}% | "
+        f"targeted_chaos={'ON' if cfg.targeted_chaos_only else 'OFF'} | "
+        f"art_bank={engine.art_bank.remaining() if engine.art_bank else 0}"
     )
     print(f"Device: {engine.device} | Policy: {engine.policy_name}")
     print(f"Local VLM ({cfg.llm_model} @ {cfg.llm_url}): {'ONLINE' if engine.ollama_ready else 'OFFLINE (fallback)'}")
@@ -114,13 +157,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 os_pct = pop.get("one_shot_pct", 20.0)
                 n_fac = st.get("total_active_factions", len(st["factions"]))
                 ai_pct = st.get("ai_faction_pct", 0.0)
+                cov_pct = st.get("cov_overall_pct", 0.0)
+                org_pct = st.get("organized_pct", 0.0)
                 print(
                     f"[{elapsed_m:5.1f}m | Act {st['act']} Hr {st['virtual_hour']:4.1f}/72 | "
                     f"{st['active_w']}x{st['active_h']} {st['palette_size']:2d}c | t={st['tick']:6d}/{lim}] "
                     f"{st['total_placements']:11,d} px | "
                     f"{st['pixels_per_sec']:6,d} px/s | "
-                    f"users={u_tot:,} ({os_pct:.1f}% 1-shot) | "
-                    f"{n_fac:4d} fac ({ai_pct:.0f}% AI) | "
+                    f"users={u_tot:,} ({os_pct:.1f}% 1-shot, {org_pct:.0f}% org) | "
+                    f"{n_fac:4d} fac ({ai_pct:.0f}% AI, cov={cov_pct:.0f}%) | "
                     f"{st['brain_status']}",
                     flush=True,
                 )
@@ -246,6 +291,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         preset_baseline_2000,
         preset_tuned_1024,
         preset_tuned_2000,
+        preset_ytshort,
         run_macro_plan,
     )
 
@@ -253,6 +299,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         cfg = preset_baseline_2000()
     elif args.profile == "tuned1024":
         cfg = preset_tuned_1024()
+    elif args.profile == "ytshort":
+        cfg = preset_ytshort()
     else:
         cfg = preset_tuned_2000()
 
@@ -264,6 +312,12 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         cfg.size_multiplier = args.size_mult
     if args.burnout_cov is not None:
         cfg.burnout_min_coverage = args.burnout_cov
+    if args.land_rush_cov is not None:
+        cfg.land_rush_target_cov = args.land_rush_cov
+    if args.organized_target is not None:
+        cfg.target_organized_share = args.organized_target
+    if args.bg_cohesion is not None:
+        cfg.free_agent_clustering = args.bg_cohesion
     cfg.seed = args.seed
 
     t0 = time.perf_counter()
@@ -283,23 +337,55 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_forge_bank(args: argparse.Namespace) -> int:
+    from pixel_battle.art.bank import forge_art_bank
+
+    forge_art_bank(
+        bank_dir=Path(args.out_dir),
+        total_concepts=args.concepts,
+        target_flux=args.flux_count,
+        size_mult=args.size_mult,
+        llm_url=args.llm_url,
+        llm_model=args.llm_model,
+        keychain_service=args.keychain_service,
+        flux_steps=args.flux_steps,
+        manage_lms=not args.no_manage_lms,
+        seed=args.seed,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pixel-battle", description="Local AI/ML Reddit r/place simulation")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_run = sub.add_parser("run", help="Start the live pixel battle simulation")
-    p_run.add_argument("--preset", choices=["standard", "large", "reddit2022"], default="standard", help="Scale preset")
+    p_run.add_argument("--preset", choices=["standard", "large", "reddit2022", "ytshort"], default="standard", help="Scale preset")
     p_run.add_argument("--width", type=int, default=None)
     p_run.add_argument("--height", type=int, default=None)
     p_run.add_argument("--users", type=int, default=None)
-    p_run.add_argument("--max-ticks", type=int, default=8_000)
+    p_run.add_argument("--max-ticks", type=int, default=None, help="Simulated tick horizon (overrides preset default)")
     p_run.add_argument("--max-hours", type=float, default=0.0, help="If > 0, run for this many wall-clock hours cleanly")
     p_run.add_argument("--chaos-ticks", type=int, default=None)
     p_run.add_argument("--discovery-interval", type=int, default=None)
     p_run.add_argument("--epoch-interval", type=int, default=None)
     p_run.add_argument("--flash-raid-interval", type=int, default=None)
     p_run.add_argument("--max-factions", type=int, default=None)
+    p_run.add_argument("--spawn-rate", type=float, default=None, help="Target factions spawned per wall-clock minute")
+    p_run.add_argument("--size-mult", type=float, default=None, help="Artwork dimension scale multiplier (e.g. 0.85)")
+    p_run.add_argument("--burnout-cov", type=float, default=None, help="Min coverage gate (0..1) before burnout activates")
+    p_run.add_argument("--burnout-age-vhours", type=float, default=None, help="Virtual hours before burnout decay starts")
+    p_run.add_argument("--land-rush-cov", type=float, default=None, help="Target fill (0..1) for newly opened wings")
+    p_run.add_argument("--organized-target", type=float, default=None, help="Target organized citizen share (0..0.95)")
+    p_run.add_argument("--bg-cohesion", type=float, default=None, help="Free-agent background cohesion (0=confetti, 1=blobs)")
+    p_run.add_argument("--sync", action="store_true", help="Deterministic step-locked mode (finish all AI/art work before tick+1)")
+    p_run.add_argument("--day0-factions", type=int, default=None, help="Prepped Day-0 Launch Wave faction count (Ticks 1..45)")
+    p_run.add_argument("--target-factions", type=int, default=None, help="Exact total unique factions to spawn in sync mode")
+    p_run.add_argument("--factions-per-wave", type=int, default=None, help="Factions spawned per scheduled wave in sync mode")
+    p_run.add_argument("--targeted-chaos", action="store_true", help="Pure white empty space; chaotic players attack active art only")
+    p_run.add_argument("--no-generic-fallbacks", action="store_true", help="Disable generic procedural shields & enforce <=1 copy/template")
+    p_run.add_argument("--art-bank", default=None, help="Path to pre-forged Art Bank directory from `forge-bank`")
     p_run.add_argument("--tps", type=float, default=18.0, help="Target ticks/sec (0 = uncapped)")
     p_run.add_argument("--llm-url", default=None, help="OpenAI-compatible local LLM endpoint (e.g. http://localhost:1234/v1)")
     p_run.add_argument("--llm-model", default=None, help="Local VLM model name (e.g. qwen3-vl-30b-a3b-instruct-mlx)")
@@ -363,15 +449,31 @@ def main(argv: list[str] | None = None) -> int:
     p_test.set_defaults(func=_cmd_test_stack)
 
     p_plan = sub.add_parser("plan", help="Fast ~1s macro community simulation and storyboard MP4 preview")
-    p_plan.add_argument("--profile", choices=["baseline2000", "tuned1024", "tuned2000"], default="tuned2000")
+    p_plan.add_argument("--profile", choices=["baseline2000", "tuned1024", "tuned2000", "ytshort"], default="tuned2000")
     p_plan.add_argument("--hours", type=float, default=None)
     p_plan.add_argument("--spawn-rate", type=float, default=None, help="Factions spawned per wall-clock minute")
     p_plan.add_argument("--size-mult", type=float, default=None, help="Artwork dimension scale multiplier")
     p_plan.add_argument("--burnout-cov", type=float, default=None, help="Min coverage before burnout activates (0..1)")
+    p_plan.add_argument("--land-rush-cov", type=float, default=None, help="Target fill (0..1) for newly opened wings")
+    p_plan.add_argument("--organized-target", type=float, default=None, help="Target organized citizen share (0..0.95)")
+    p_plan.add_argument("--bg-cohesion", type=float, default=None, help="Free-agent background cohesion (0..1)")
     p_plan.add_argument("--out-dir", default="runs/plan_preview")
     p_plan.add_argument("--no-mp4", action="store_true")
     p_plan.add_argument("--seed", type=int, default=2022)
     p_plan.set_defaults(func=_cmd_plan)
+
+    p_bank = sub.add_parser("forge-bank", help="Decoupled 2-stage Art Bank creator (Qwen3-VL solo -> MLX FLUX solo)")
+    p_bank.add_argument("--out-dir", default="runs/art_bank_ytshort", help="Output Art Bank directory")
+    p_bank.add_argument("--concepts", type=int, default=480, help="Total unique community concepts to brainstorm")
+    p_bank.add_argument("--flux-count", type=int, default=380, help="Unique FLUX pixel-art blueprints to forge")
+    p_bank.add_argument("--size-mult", type=float, default=0.85, help="Artwork dimension scale multiplier")
+    p_bank.add_argument("--llm-url", default="http://localhost:1234/v1")
+    p_bank.add_argument("--llm-model", default="qwen3-vl-30b-a3b-instruct-mlx")
+    p_bank.add_argument("--keychain-service", default="place-sim")
+    p_bank.add_argument("--flux-steps", type=int, default=4)
+    p_bank.add_argument("--no-manage-lms", action="store_true", help="Do not auto-load/unload LM Studio between stages")
+    p_bank.add_argument("--seed", type=int, default=2026)
+    p_bank.set_defaults(func=_cmd_forge_bank)
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)

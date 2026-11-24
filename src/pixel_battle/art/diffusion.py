@@ -114,8 +114,8 @@ def _flood_strip_background_perceptual(bp: np.ndarray, lab_tol: float = 24.0) ->
                 visited[ny, nx] = True
                 q.append((ny, nx))
 
-    # Safety: if stripping ate > 82% of pixels, fall back to organic feathered edge instead of blank
-    if stripped > 0.82 * h * w:
+    # Safety: only fall back if stripping wiped almost everything (>95% gone); otherwise keep tight cutout!
+    if stripped > 0.95 * h * w or (h * w - stripped) < 28:
         return _organic_feather_edges(bp)
     # Remove tiny 1-2px floating dust specks left in transparent margin
     out = _remove_isolated_specks(out)

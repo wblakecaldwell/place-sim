@@ -19,7 +19,7 @@ from pixel_battle.ml.model import (
     NO_GOAL_IDX,
     RedditCitizenNet,
 )
-from pixel_battle.palette import BLACK_IDX, WHITE_IDX
+from pixel_battle.palette import BLACK_IDX, NUM_COLORS, WHITE_IDX
 from pixel_battle.policies.base import PlacementBatch
 from pixel_battle.policies.stochastic import StochasticPolicy
 
@@ -48,6 +48,9 @@ class NeuralRedditPolicy(StochasticPolicy):
         temp_pos: float = 0.95,
         temp_col: float = 0.85,
         max_factions_per_tick: int = 180,
+        target_organized_share: float = 0.80,
+        free_agent_clustering: float = 0.65,
+        targeted_chaos_only: bool = False,
     ) -> None:
         super().__init__(
             num_users=num_users,
@@ -56,6 +59,9 @@ class NeuralRedditPolicy(StochasticPolicy):
             base_cooldown=base_cooldown,
             device=device,
             seed=seed,
+            target_organized_share=target_organized_share,
+            free_agent_clustering=free_agent_clustering,
+            targeted_chaos_only=targeted_chaos_only,
         )
         self.model_path = Path(model_path)
         self.temp_pos = temp_pos
@@ -247,17 +253,28 @@ class NeuralRedditPolicy(StochasticPolicy):
 
         ready_fac = self.user_factions[ready_ids]
 
-        # 1. Free agents (including one-shot citizens) in one batched neural pass
+        # 1. Free agents (including one-shot citizens)
         free_u = ready_ids[ready_fac == -1]
         if free_u.numel() > 0:
-            fx, fy, fc = self._step_free_agents(free_u, canvas)
-            fc = self._clamp_colors_to_allowed(fc, canvas)
-            out_xs.append(fx.clamp(0, W_act - 1))
-            out_ys.append(fy.clamp(0, H_act - 1))
-            out_cols.append(fc)
-            out_facs.append(torch.full((free_u.numel(),), -1, dtype=torch.int16, device=dev))
-            out_uids.append(self.slot_user_ids[free_u].to(torch.int64))
-            placed_slots_list.append(free_u)
+            if self.targeted_chaos_only:
+                fx, fy, fc, used_free = self._step_targeted_chaos(tick, free_u, canvas, factions)
+                if fx.numel() > 0:
+                    fc = self._clamp_colors_to_allowed(fc, canvas)
+                    out_xs.append(fx.clamp(0, W_act - 1))
+                    out_ys.append(fy.clamp(0, H_act - 1))
+                    out_cols.append(fc)
+                    out_facs.append(torch.full((fx.numel(),), -1, dtype=torch.int16, device=dev))
+                    out_uids.append(self.slot_user_ids[used_free].to(torch.int64))
+                    placed_slots_list.append(used_free)
+            else:
+                fx, fy, fc = self._step_free_agents(free_u, canvas)
+                fc = self._clamp_colors_to_allowed(fc, canvas)
+                out_xs.append(fx.clamp(0, W_act - 1))
+                out_ys.append(fy.clamp(0, H_act - 1))
+                out_cols.append(fc)
+                out_facs.append(torch.full((free_u.numel(),), -1, dtype=torch.int16, device=dev))
+                out_uids.append(self.slot_user_ids[free_u].to(torch.int64))
+                placed_slots_list.append(free_u)
 
         # 2. Gather ready members across active factions in O(N_ready)
         fac_by_id = {f.id: f for f in factions if f.alive}
@@ -529,41 +546,28 @@ class NeuralRedditPolicy(StochasticPolicy):
         n = int(u_ids.numel())
         dev = self.device
         W, H = canvas.active_w, canvas.active_h
+        c = self.free_agent_clustering
 
-        jump_mask = torch.rand(n, device=dev) < 0.14
         cx = self.pos_x[u_ids].clamp(0, W - 1).clone()
         cy = self.pos_y[u_ids].clamp(0, H - 1).clone()
 
-        n_jump = int(jump_mask.sum().item())
-        if n_jump > 0:
-            corner_mask = torch.rand(n_jump, device=dev) < 0.25
-            act_view = canvas.activity[:H, :W]
-            pool_w = max(1, W // 16)
-            coarse = F.avg_pool2d(
-                act_view.unsqueeze(0).unsqueeze(0), kernel_size=16, stride=16
-            ).flatten()
-            cell_idx = torch.multinomial(coarse + 0.12, n_jump, replacement=True)
-            jx = ((cell_idx % pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)).to(torch.int32).clamp(0, W - 1)
-            jy = ((cell_idx // pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)).to(torch.int32).clamp(0, H - 1)
-            n_c = int(corner_mask.sum().item())
-            if n_c > 0:
-                which = torch.randint(0, 4, (n_c,), device=dev)
-                edge_off_x = torch.randint(0, min(42, W), (n_c,), dtype=torch.int32, device=dev)
-                edge_off_y = torch.randint(0, min(42, H), (n_c,), dtype=torch.int32, device=dev)
-                ex = torch.where((which & 1) == 0, edge_off_x, (W - 1) - edge_off_x)
-                ey = torch.where((which & 2) == 0, edge_off_y, (H - 1) - edge_off_y)
-                jx[corner_mask] = ex
-                jy[corner_mask] = ey
-            cx[jump_mask] = jx
-            cy[jump_mask] = jy
+        # Real r/place behavior: people flock to existing painted art, active borders, and Schelling hubs —
+        # they do NOT carpet empty white space with TV-static noise!
+        on_white = canvas.colors[cy, cx] == WHITE_IDX
+        jump_mask = (torch.rand(n, device=dev) < 0.22) | (on_white & (torch.rand(n, device=dev) < 0.96))
+        jx, jy = self._sample_focal_positions(n, canvas)
+        cx = torch.where(jump_mask, jx, cx)
+        cy = torch.where(jump_mask, jy, cy)
 
-        cx = (cx + torch.randint(-3, 4, (n,), dtype=torch.int32, device=dev)).clamp(0, W - 1)
-        cy = (cy + torch.randint(-3, 4, (n,), dtype=torch.int32, device=dev)).clamp(0, H - 1)
+        cx = (cx + torch.randint(-1, 2, (n,), dtype=torch.int32, device=dev)).clamp(0, W - 1)
+        cy = (cy + torch.randint(-1, 2, (n,), dtype=torch.int32, device=dev)).clamp(0, H - 1)
 
         cur_p, prev_p, rec_p = self._extract_canvas_patches(self._cur_tick, canvas, cx, cy)
         goal_p = torch.full_like(cur_p, NO_GOAL_IDX)
         arch = self.citizen_arch[u_ids]
 
+        # Background cohesion modulates color temperature at active frontiers (calm blobs vs lively doodles)
+        eff_temp_col = max(0.50, 0.95 - 0.40 * c)
         dy, dx, cols = self._run_net_batched(
             cur_p,
             prev_p,
@@ -571,14 +575,16 @@ class NeuralRedditPolicy(StochasticPolicy):
             goal_p,
             arch,
             temp_pos=self.temp_pos,
-            temp_col=self.temp_col,
+            temp_col=eff_temp_col,
             allowed_color_mask=canvas.allowed_color_mask,
         )
 
+        # Keep untouched open white patches clean; only a tiny pioneer trickle seeds new focal dots
         blank_patch = (cur_p == WHITE_IDX).all(dim=(1, 2))
-        seed_blank = blank_patch & (torch.rand(n, device=dev) < 0.45)
+        seed_blank = blank_patch & (torch.rand(n, device=dev) < 0.03)
         pref_allowed = self._clamp_colors_to_allowed(self.pref_color[u_ids], canvas)
         cols = torch.where(seed_blank, pref_allowed, cols)
+        cols = torch.where(blank_patch & (~seed_blank), torch.full_like(cols, WHITE_IDX), cols)
 
         px = (cx + dx).clamp(0, W - 1)
         py = (cy + dy).clamp(0, H - 1)
@@ -611,7 +617,7 @@ class NeuralRedditPolicy(StochasticPolicy):
                 lx = idx % w
                 xs_parts.append((lx + x0).to(torch.int32))
                 ys_parts.append((ly + y0).to(torch.int32))
-                cs_parts.append(bp[ly, lx].to(torch.uint8))
+                cs_parts.append(bp[ly, lx].clamp(0, NUM_COLORS - 1).to(torch.uint8))
                 k_tendril = k - k_bp
 
         if k_tendril > 0:

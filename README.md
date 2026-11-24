@@ -79,7 +79,10 @@ uv run --with pytest pytest -v tests/test_core.py
   ```
 - **Subreddit community directory:** If `data/subreddits/retained_active_subreddits.csv` (from the public [ssingh22/reddit-activity](https://huggingface.co/datasets/ssingh22/reddit-activity) dataset) is present, community inspiration samples real active non-NSFW subreddits by rank; otherwise `subreddits.py` falls back to its built-in list.
 
-## Specification & License
+## Visual Evolution & Docs
 
-- System requirements are maintained in [REQUIREMENTS.md](REQUIREMENTS.md) following ASD-STE100 (Simplified Technical English).
+- **[Visual Progression Gallery](gallery/README.md):** Side-by-side snapshots, progression strips, and engineering post-mortems across all 8 simulation runs (from the original `512x512` baseline to the `360x640` vertical YouTube Short pipeline).
+- **[Run Profiles](RUN_PROFILES.md):** Creative presets (`ytshort`, `reddit2022`, `standard`).
+- **[Lessons Learned](LESSONS_LEARNED.md):** Apple Silicon MLX/MPS memory tuning, Art Bank decoupling, and visual bug post-mortems.
+- **[Requirements](REQUIREMENTS.md):** System specification maintained under ASD-STE100 (Simplified Technical English).
 - Released under the [MIT License](LICENSE).

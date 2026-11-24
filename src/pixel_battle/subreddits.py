@@ -93,7 +93,8 @@ class SubredditSampler:
                             for bad in (
                                 "porn", "nsfw", "gore", "drug", "weed", "420",
                                 "sex", "nude", "hentai", "fuck", "shit", "bitch",
-                                "dick", "cock", "pussy",
+                                "dick", "cock", "pussy", "asshole", "bastard",
+                                "slut", "whore", "cunt", "boob", "titty",
                             )
                         ):
                             continue

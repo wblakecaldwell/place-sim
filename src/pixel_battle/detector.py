@@ -115,10 +115,10 @@ def find_pareidolia_candidates(
             top3_share = float(counts[top_cols[:3]].sum() / max(1, len(painted)))
             act_score = float(activity[y0 : y0 + window, x0 : x0 + window].mean())
 
-            if is_corner and window >= 36:
-                wall_bonus = 0.65
-            elif is_edge and alive_edge_count < 16:
-                wall_bonus = 0.22
+            if is_corner and window >= 36 and alive_edge_count < 6:
+                wall_bonus = 0.25
+            elif is_edge and alive_edge_count < 10:
+                wall_bonus = 0.08
             else:
                 wall_bonus = 0.0
 
@@ -237,13 +237,14 @@ def find_ribbon_track(
     # Diagonal ('d1' or 'd2') starting from a corner or edge
     init_diag = rng.choice([72, 88])
     if axis == "d1":
-        off = rng.randint(0, max(1, W - init_diag - 60))
         if rng.random() < 0.5:
-            return off, 0, init_diag, init_diag
-        return 0, off, init_diag, init_diag
+            off_x = rng.randint(0, max(1, W - init_diag - 60))
+            return off_x, 0, init_diag, init_diag
+        off_y = rng.randint(0, max(1, H - init_diag - 60))
+        return 0, off_y, init_diag, init_diag
     else:
-        off = rng.randint(0, max(1, W - init_diag - 60))
-        return off, max(0, H - init_diag), init_diag, init_diag
+        off_x = rng.randint(0, max(1, W - init_diag - 60))
+        return off_x, max(0, H - init_diag), init_diag, init_diag
 
 
 def update_faction_metrics(
@@ -317,8 +318,9 @@ def find_open_exodus_spot(
     h: int,
     exclude_faction_id: int = -1,
     prefer_region: tuple[int, int, int, int] | None = None,
+    rng: random.Random | None = None,
 ) -> tuple[int, int]:
-    """Find the least-contested (x0, y0) rectangle inside the active viewport for exodus or fresh placement."""
+    """Find a clean, least-contested (x0, y0) rectangle distributed across the active viewport (not stuck at y=0)."""
     H, W = canvas.active_h, canvas.active_w
     occupied = np.zeros((H, W), dtype=np.float32)
     for f in factions:
@@ -332,21 +334,164 @@ def find_open_exodus_spot(
     if rx1 - rx0 < w or ry1 - ry0 < h:
         rx0, ry0, rx1, ry1 = 0, 0, W, H
 
+    _rng = rng or random.Random()
     best_score = 1e9
     best_pos = (rx0, ry0)
-    step = max(16, int(max(W, H) // 48))
-    xs = sorted(set(list(range(rx0, max(rx0 + 1, rx1 - w), step)) + [max(rx0, rx1 - w)]))
-    ys = sorted(set(list(range(ry0, max(ry0 + 1, ry1 - h), step)) + [max(ry0, ry1 - h)]))
-    act = canvas.activity[:H, :W].detach().cpu().numpy()
-    for y0 in ys:
-        for x0 in xs:
-            occ = float(occupied[y0 : y0 + h, x0 : x0 + w].mean())
-            churn = float(act[y0 : y0 + h, x0 : x0 + w].mean())
-            score = occ * 10.0 + churn * 0.5
-            if score < best_score:
-                best_score = score
-                best_pos = (x0, y0)
+    # Fast randomized candidate sampling spreads spawns evenly across the full height & width
+    max_x = max(rx0, rx1 - w)
+    max_y = max(ry0, ry1 - h)
+    for _ in range(48):
+        x0 = _rng.randint(rx0, max_x) if max_x > rx0 else rx0
+        y0 = _rng.randint(ry0, max_y) if max_y > ry0 else ry0
+        occ = float(occupied[y0 : y0 + h, x0 : x0 + w].mean())
+        score = occ * 10.0 + _rng.random() * 0.15
+        if score < best_score:
+            best_score = score
+            best_pos = (x0, y0)
+            if occ == 0.0:
+                break
     return best_pos
+
+
+def find_neighbor_spawn_spot(
+    canvas: CanvasState,
+    factions: list[Faction],
+    w: int,
+    h: int,
+    rng: random.Random | None = None,
+    prefer_region: tuple[int, int, int, int] | None = None,
+    max_overlap: float = 0.14,
+) -> tuple[int, int] | None:
+    """Pack a new artwork snugly next to an existing alive artwork (0-2px seam) so r/place neighborhoods grow organically."""
+    H, W = canvas.active_h, canvas.active_w
+    rx0, ry0, rx1, ry1 = prefer_region if prefer_region is not None else (0, 0, W, H)
+    rx0, ry0 = max(0, rx0), max(0, ry0)
+    rx1, ry1 = min(W, rx1), min(H, ry1)
+    if rx1 - rx0 < w or ry1 - ry0 < h:
+        rx0, ry0, rx1, ry1 = 0, 0, W, H
+
+    anchors = [
+        f for f in factions
+        if f.alive and not f.is_void and f.art_mode != "ribbon"
+        and f.x1 > rx0 and f.x0 < rx1 and f.y1 > ry0 and f.y0 < ry1
+    ]
+    if not anchors:
+        return None
+
+    occupied = np.zeros((H, W), dtype=bool)
+    for f in factions:
+        if not f.alive:
+            continue
+        occupied[max(0, f.y0) : min(H, f.y1), max(0, f.x0) : min(W, f.x1)] = True
+
+    _rng = rng or random.Random()
+    _rng.shuffle(anchors)
+    best: tuple[int, int] | None = None
+    best_occ = max_overlap
+    for anchor in anchors[:24]:
+        gap = _rng.randint(0, 2)
+        sides = [
+            (anchor.x1 + gap, anchor.y0 + _rng.randint(-h // 3, max(0, anchor.h - h // 2))),
+            (anchor.x0 - w - gap, anchor.y0 + _rng.randint(-h // 3, max(0, anchor.h - h // 2))),
+            (anchor.x0 + _rng.randint(-w // 3, max(0, anchor.w - w // 2)), anchor.y1 + gap),
+            (anchor.x0 + _rng.randint(-w // 3, max(0, anchor.w - w // 2)), anchor.y0 - h - gap),
+        ]
+        _rng.shuffle(sides)
+        for cx, cy in sides:
+            cx = max(rx0, min(rx1 - w, cx))
+            cy = max(ry0, min(ry1 - h, cy))
+            occ = float(occupied[cy : cy + h, cx : cx + w].mean())
+            if occ < best_occ:
+                best_occ = occ
+                best = (cx, cy)
+                if occ == 0.0:
+                    return best
+    return best
+
+
+def find_whitespace_niche(
+    canvas: CanvasState,
+    factions: list[Faction],
+    rng: random.Random | None = None,
+    min_dim: int = 10,
+    max_w: int = 38,
+    max_h: int = 34,
+) -> tuple[int, int, int, int, np.ndarray] | None:
+    """Locate an unclaimed pixel-level whitespace niche (x0, y0, w, h, local_free_mask) of organic varied size."""
+    H, W = canvas.active_h, canvas.active_w
+    claimed = np.zeros((H, W), dtype=bool)
+    for f in factions:
+        if not f.alive:
+            continue
+        y0, y1 = max(0, f.y0), min(H, f.y1)
+        x0, x1 = max(0, f.x0), min(W, f.x1)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        bp_np = getattr(f, "_bp_cpu_cache", None)
+        if bp_np is None or bp_np.shape != (f.h, f.w):
+            bp_np = f.blueprint.detach().cpu().numpy()
+            f._bp_cpu_cache = bp_np  # type: ignore[attr-defined]
+        sub = bp_np[: y1 - y0, : x1 - x0]
+        claimed[y0:y1, x0:x1] |= sub >= 0
+
+    free = ~claimed
+    free_ys, free_xs = np.where(free)
+    n_free = len(free_ys)
+    if n_free < min_dim * min_dim:
+        return None
+
+    _rng = rng or random.Random()
+    best: tuple[int, int, int, int, np.ndarray] | None = None
+    best_score = -1.0
+
+    # Sample varied niche target aspect ratios so every niche faction has a distinct organic size!
+    for _ in range(36):
+        pick = _rng.randint(0, n_free - 1)
+        sy = int(free_ys[pick])
+        sx = int(free_xs[pick])
+        cap_w = _rng.randint(min_dim + 2, max(min_dim + 2, max_w))
+        cap_h = _rng.randint(min_dim + 2, max(min_dim + 2, max_h))
+
+        x0 = max(0, sx - 3)
+        x1 = min(W, sx + 4)
+        y0 = max(0, sy - 3)
+        y1 = min(H, sy + 4)
+
+        # Greedily grow outward into contiguous unclaimed whitespace in all 4 directions
+        for _step in range(14):
+            grew = False
+            if (x1 - x0) < cap_w:
+                if x0 > 0 and float(free[y0:y1, max(0, x0 - 2) : x0].mean()) >= 0.45:
+                    x0 = max(0, x0 - 2)
+                    grew = True
+                if x1 < W and (x1 - x0) < cap_w and float(free[y0:y1, x1 : min(W, x1 + 2)].mean()) >= 0.45:
+                    x1 = min(W, x1 + 2)
+                    grew = True
+            if (y1 - y0) < cap_h:
+                if y0 > 0 and float(free[max(0, y0 - 2) : y0, x0:x1].mean()) >= 0.45:
+                    y0 = max(0, y0 - 2)
+                    grew = True
+                if y1 < H and (y1 - y0) < cap_h and float(free[y1 : min(H, y1 + 2), x0:x1].mean()) >= 0.45:
+                    y1 = min(H, y1 + 2)
+                    grew = True
+            if not grew:
+                break
+
+        nw, nh = x1 - x0, y1 - y0
+        if nw < min_dim or nh < min_dim:
+            continue
+        loc = free[y0:y1, x0:x1]
+        free_px = int(loc.sum())
+        if free_px < max(55, int(nw * nh * 0.42)):
+            continue
+        # Favor substantial unclaimed pockets AND corners/edges so perimeter gaps vanish fast
+        edge_bonus = 1.25 if (x0 <= 2 or y0 <= 2 or x1 >= W - 2 or y1 >= H - 2) else 1.0
+        score = float(free_px) * edge_bonus * (0.85 + 0.30 * _rng.random())
+        if score > best_score:
+            best_score = score
+            best = (x0, y0, nw, nh, loc.copy())
+
+    return best
 
 
 def find_void_spawn_spot(canvas: CanvasState, factions: list[Faction], size: int = 84) -> tuple[int, int]:

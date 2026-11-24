@@ -40,6 +40,9 @@ class StochasticPolicy:
         base_cooldown: int,
         device: torch.device,
         seed: int = 42,
+        target_organized_share: float = 0.80,
+        free_agent_clustering: float = 0.65,
+        targeted_chaos_only: bool = False,
     ) -> None:
         self.num_users = num_users
         self.width = width
@@ -50,10 +53,29 @@ class StochasticPolicy:
         self.enable_timezones: bool = True
         self.base_cooldown = max(4, base_cooldown)
         self.device = device
+        self.target_organized_share = max(0.05, min(0.95, float(target_organized_share)))
+        self.free_agent_clustering = max(0.0, min(1.0, float(free_agent_clustering)))
+        self.targeted_chaos_only = bool(targeted_chaos_only)
+        self._chaos_squads: list[dict[str, int]] = []
+        self._chaos_rng_state: int = seed + 9091
 
         g = torch.Generator(device="cpu").manual_seed(seed)
-        self.pos_x = torch.randint(0, width, (num_users,), generator=g, dtype=torch.int32).to(device)
-        self.pos_y = torch.randint(0, height, (num_users,), generator=g, dtype=torch.int32).to(device)
+        # Initialize citizens around Schelling focal hubs (center + 4 corners + 4 mid-canvas hubs)
+        # so empty white space stays clean instead of carpeting the blank canvas with TV static!
+        hubs_x = torch.tensor(
+            [width // 2, 16, max(16, width - 17), 16, max(16, width - 17), width // 2, width // 2, width // 4, (3 * width) // 4],
+            dtype=torch.int32,
+        )
+        hubs_y = torch.tensor(
+            [height // 2, 16, 16, max(16, height - 17), max(16, height - 17), height // 4, (3 * height) // 4, height // 2, height // 2],
+            dtype=torch.int32,
+        )
+        h_pick = torch.randint(0, len(hubs_x), (num_users,), generator=g)
+        spread = max(12, min(42, min(width, height) // 14))
+        jx = torch.randint(-spread, spread + 1, (num_users,), generator=g, dtype=torch.int32)
+        jy = torch.randint(-spread, spread + 1, (num_users,), generator=g, dtype=torch.int32)
+        self.pos_x = (hubs_x[h_pick] + jx).clamp(0, width - 1).to(device)
+        self.pos_y = (hubs_y[h_pick] + jy).clamp(0, height - 1).to(device)
         self.cooldown = torch.randint(1, self.base_cooldown + 1, (num_users,), generator=g, dtype=torch.int32).to(device)
         self.user_factions = torch.full((num_users,), -1, dtype=torch.int16, device=device)
 
@@ -79,7 +101,8 @@ class StochasticPolicy:
         nearest_basin = d2.argmin(dim=1)
         basin_pref = bcol[nearest_basin]
         rand_pref = torch.randint(1, NUM_COLORS, (num_users,), generator=g, dtype=torch.uint8)
-        use_basin = torch.rand(num_users, generator=g) < 0.65
+        basin_prob = 0.10 + 0.82 * self.free_agent_clustering
+        use_basin = torch.rand(num_users, generator=g) < basin_prob
         self.pref_color = torch.where(use_basin, basin_pref, rand_pref).to(device)
 
         # Citizen archetype traits:
@@ -183,6 +206,34 @@ class StochasticPolicy:
         self._consume_and_recycle_sessions(ready_ids, canvas=canvas)
         return batch
 
+    def _sample_focal_positions(
+        self, n: int, canvas: CanvasState
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample (x, y) coordinates drawn to existing painted clusters, active borders, and Schelling hubs (leaving empty white clean)."""
+        dev = self.device
+        W, H = canvas.active_w, canvas.active_h
+        stride = 16
+        painted = (canvas.colors[:H, :W] != WHITE_IDX).to(torch.float32)
+        act_view = canvas.activity[:H, :W]
+        signal = act_view * 1.6 + painted * 2.4
+        coarse = F.avg_pool2d(
+            signal.unsqueeze(0).unsqueeze(0), kernel_size=stride, stride=stride
+        ).squeeze(0).squeeze(0)
+        gh, gw = coarse.shape
+        # Anchor subtle Schelling focal points (center + 4 corners) when canvas is freshly blank
+        coarse = coarse.clone()
+        coarse[gh // 2, gw // 2] += 0.45
+        coarse[0, 0] += 0.35
+        coarse[0, gw - 1] += 0.35
+        coarse[gh - 1, 0] += 0.35
+        coarse[gh - 1, gw - 1] += 0.35
+        # Tiny uniform floor (0.0015) so untouched empty white space stays crisp and clean
+        probs = (coarse + 0.0015).flatten()
+        cell_idx = torch.multinomial(probs, n, replacement=True)
+        cx = ((cell_idx % gw) * stride + torch.randint(0, stride, (n,), device=dev)).clamp(0, W - 1).to(torch.int32)
+        cy = ((cell_idx // gw) * stride + torch.randint(0, stride, (n,), device=dev)).clamp(0, H - 1).to(torch.int32)
+        return cx, cy
+
     def _consume_and_recycle_sessions(
         self,
         placed_slot_ids: torch.Tensor,
@@ -218,11 +269,14 @@ class StochasticPolicy:
         self.initial_clicks[done_slots] = new_budgets
         self.remaining_clicks[done_slots] = new_budgets
         self.user_factions[done_slots] = -1
-        self.pos_x[done_slots] = torch.randint(0, aw, (n_done,), dtype=torch.int32, device=dev)
-        self.pos_y[done_slots] = torch.randint(0, ah, (n_done,), dtype=torch.int32, device=dev)
         if canvas is not None:
+            fx, fy = self._sample_focal_positions(n_done, canvas)
+            self.pos_x[done_slots] = fx
+            self.pos_y[done_slots] = fy
             self.pref_color[done_slots] = self._random_allowed_colors(n_done, canvas, non_white=True)
         else:
+            self.pos_x[done_slots] = torch.randint(0, aw, (n_done,), dtype=torch.int32, device=dev)
+            self.pos_y[done_slots] = torch.randint(0, ah, (n_done,), dtype=torch.int32, device=dev)
             self.pref_color[done_slots] = torch.randint(1, NUM_COLORS, (n_done,), dtype=torch.uint8, device=dev)
         self.loyalty[done_slots] = 0.25 + 0.70 * torch.rand(n_done, device=dev)
 
@@ -286,14 +340,25 @@ class StochasticPolicy:
         # 1. Free agents (faction_id == -1)
         free_u = ready_ids[ready_fac == -1]
         if free_u.numel() > 0:
-            fx, fy, fc = self._step_free_agents(free_u, canvas)
-            fc = self._clamp_colors_to_allowed(fc, canvas)
-            out_xs.append(fx.clamp(0, canvas.active_w - 1))
-            out_ys.append(fy.clamp(0, canvas.active_h - 1))
-            out_cols.append(fc)
-            out_facs.append(torch.full((free_u.numel(),), -1, dtype=torch.int16, device=self.device))
-            out_uids.append(self.slot_user_ids[free_u].to(torch.int64))
-            placed_slots_list.append(free_u)
+            if self.targeted_chaos_only:
+                fx, fy, fc, used_free = self._step_targeted_chaos(tick, free_u, canvas, factions)
+                if fx.numel() > 0:
+                    fc = self._clamp_colors_to_allowed(fc, canvas)
+                    out_xs.append(fx.clamp(0, canvas.active_w - 1))
+                    out_ys.append(fy.clamp(0, canvas.active_h - 1))
+                    out_cols.append(fc)
+                    out_facs.append(torch.full((fx.numel(),), -1, dtype=torch.int16, device=self.device))
+                    out_uids.append(self.slot_user_ids[used_free].to(torch.int64))
+                    placed_slots_list.append(used_free)
+            else:
+                fx, fy, fc = self._step_free_agents(free_u, canvas)
+                fc = self._clamp_colors_to_allowed(fc, canvas)
+                out_xs.append(fx.clamp(0, canvas.active_w - 1))
+                out_ys.append(fy.clamp(0, canvas.active_h - 1))
+                out_cols.append(fc)
+                out_facs.append(torch.full((free_u.numel(),), -1, dtype=torch.int16, device=self.device))
+                out_uids.append(self.slot_user_ids[free_u].to(torch.int64))
+                placed_slots_list.append(free_u)
 
         # Index active factions and allied borders
         fac_by_id = {f.id: f for f in factions if f.alive}
@@ -375,6 +440,148 @@ class StochasticPolicy:
         self._consume_and_recycle_sessions(torch.cat(placed_slots_list), canvas=canvas)
         return batch
 
+    def _step_targeted_chaos(
+        self,
+        tick: int,
+        u_ids: torch.Tensor,
+        canvas: CanvasState,
+        factions: list[Faction],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Targeted chaos mode: zero empty-space noise; chaotic players attack active artworks via random griefers & mini-raid squads."""
+        dev = self.device
+        W, H = canvas.active_w, canvas.active_h
+        empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+        empty_u8 = torch.empty(0, dtype=torch.uint8, device=dev)
+        empty_idx = torch.empty(0, dtype=u_ids.dtype, device=dev)
+
+        alive_art = [f for f in factions if f.alive and not f.is_void and f.w >= 8 and f.h >= 8]
+        if not alive_art:
+            return empty_i32, empty_i32, empty_u8, empty_idx
+
+        n_raw = int(u_ids.numel())
+        # Cap per-tick chaotic attack volume so griefers & mini-mobs create lively repair battles without drowning out builders
+        max_chaos = max(120, int(self.num_users * 0.015))
+        n = min(n_raw, max_chaos)
+        used = u_ids[:n]
+
+        # Maintain 4-6 rotating small-scale coordinated Chaos Squads (40-150 players swarming tight patches on active art)
+        alive_by_id = {f.id: f for f in alive_art}
+        self._chaos_squads = [
+            sq for sq in self._chaos_squads
+            if sq["end_tick"] > tick and sq["fac_id"] in alive_by_id
+        ]
+        target_squads = min(6, max(1, len(alive_art) // 10))
+        vandal_pal = [BLACK_IDX, DARK_RED_IDX, RED_IDX, PINK_IDX, 6, 11, 19, 21]
+        while len(self._chaos_squads) < target_squads:
+            self._chaos_rng_state = (self._chaos_rng_state * 1103515245 + 12345) & 0x7FFFFFFF
+            tgt = alive_art[self._chaos_rng_state % len(alive_art)]
+            pw = max(6, min(22, tgt.w // 2))
+            ph = max(6, min(22, tgt.h // 2))
+            self._chaos_rng_state = (self._chaos_rng_state * 1103515245 + 12345) & 0x7FFFFFFF
+            ox = self._chaos_rng_state % max(1, tgt.w - pw + 1)
+            self._chaos_rng_state = (self._chaos_rng_state * 1103515245 + 12345) & 0x7FFFFFFF
+            oy = self._chaos_rng_state % max(1, tgt.h - ph + 1)
+            self._chaos_rng_state = (self._chaos_rng_state * 1103515245 + 12345) & 0x7FFFFFFF
+            c_main = vandal_pal[self._chaos_rng_state % len(vandal_pal)]
+            c_acc = vandal_pal[(self._chaos_rng_state // 7) % len(vandal_pal)]
+            dur = 55 + (self._chaos_rng_state % 45)
+            self._chaos_squads.append(
+                {
+                    "fac_id": tgt.id,
+                    "x0": tgt.x0 + ox,
+                    "y0": tgt.y0 + oy,
+                    "x1": min(W, tgt.x0 + ox + pw),
+                    "y1": min(H, tgt.y0 + oy + ph),
+                    "c_main": c_main,
+                    "c_acc": c_acc,
+                    "end_tick": tick + dur,
+                }
+            )
+
+        xs_parts: list[torch.Tensor] = []
+        ys_parts: list[torch.Tensor] = []
+        cs_parts: list[torch.Tensor] = []
+        slots_parts: list[torch.Tensor] = []
+
+        # ~35% of chaotic players form tight coordinated Chaos Squad mini-raids inside active artworks
+        n_squad_tot = int(round(n * 0.35)) if self._chaos_squads else 0
+        cursor = 0
+        if n_squad_tot > 0 and self._chaos_squads:
+            per_sq = max(1, n_squad_tot // len(self._chaos_squads))
+            for sq in self._chaos_squads:
+                take = min(per_sq, n - cursor)
+                if take <= 0:
+                    break
+                sx = torch.randint(sq["x0"], max(sq["x0"] + 1, sq["x1"]), (take,), dtype=torch.int32, device=dev)
+                sy = torch.randint(sq["y0"], max(sq["y0"] + 1, sq["y1"]), (take,), dtype=torch.int32, device=dev)
+                # Only vandalize pixels actually owned by/painted inside an artwork (keep exterior white untouched!)
+                tgt_f = alive_by_id.get(sq["fac_id"])
+                if tgt_f is not None:
+                    ly = (sy - tgt_f.y0).clamp(0, tgt_f.h - 1)
+                    lx = (sx - tgt_f.x0).clamp(0, tgt_f.w - 1)
+                    in_art = tgt_f.blueprint[ly, lx] >= 0
+                    sx = sx[in_art]
+                    sy = sy[in_art]
+                    sub_slots = used[cursor : cursor + take][in_art]
+                else:
+                    sub_slots = used[cursor : cursor + take]
+                cursor += take
+                m_cnt = int(sx.numel())
+                if m_cnt > 0:
+                    sc = torch.where(
+                        torch.rand(m_cnt, device=dev) < 0.78,
+                        torch.full((m_cnt,), sq["c_main"], dtype=torch.uint8, device=dev),
+                        torch.full((m_cnt,), sq["c_acc"], dtype=torch.uint8, device=dev),
+                    )
+                    xs_parts.append(sx)
+                    ys_parts.append(sy)
+                    cs_parts.append(sc)
+                    slots_parts.append(sub_slots)
+
+        # ~65% of chaotic players act as random griefers/vandals picking pixels strictly inside active faction artworks
+        n_grief = n - cursor
+        if n_grief > 0:
+            # Vectorized sampling across up to 64 sampled active artworks per tick (zero empty-space leaks)
+            sample_facs = alive_art if len(alive_art) <= 64 else [
+                alive_art[(tick * 17 + i * 31) % len(alive_art)] for i in range(64)
+            ]
+            x0s = torch.tensor([f.x0 for f in sample_facs], dtype=torch.int32, device=dev)
+            y0s = torch.tensor([f.y0 for f in sample_facs], dtype=torch.int32, device=dev)
+            ws = torch.tensor([max(1, f.w) for f in sample_facs], dtype=torch.int32, device=dev)
+            hs = torch.tensor([max(1, f.h) for f in sample_facs], dtype=torch.int32, device=dev)
+
+            f_pick = torch.randint(0, len(sample_facs), (n_grief,), device=dev)
+            gx = (x0s[f_pick] + (torch.rand(n_grief, device=dev) * ws[f_pick].to(torch.float32)).to(torch.int32)).clamp(0, W - 1)
+            gy = (y0s[f_pick] + (torch.rand(n_grief, device=dev) * hs[f_pick].to(torch.float32)).to(torch.int32)).clamp(0, H - 1)
+            # Restrict vandals strictly to already-painted faction pixels (never blank white canvas!)
+            on_art = canvas.owner[gy, gx] >= 0
+            gx = gx[on_art]
+            gy = gy[on_art]
+            g_slots = used[cursor : cursor + n_grief][on_art]
+            g_cnt = int(gx.numel())
+            if g_cnt > 0:
+                gc = self._random_allowed_colors(g_cnt, canvas, non_white=True)
+                # 35% mischief black dots (classic r/place eye/face griefing)
+                gc = torch.where(
+                    torch.rand(g_cnt, device=dev) < 0.35,
+                    torch.full((g_cnt,), BLACK_IDX, dtype=torch.uint8, device=dev),
+                    gc,
+                )
+                xs_parts.append(gx)
+                ys_parts.append(gy)
+                cs_parts.append(gc)
+                slots_parts.append(g_slots)
+
+        if not xs_parts:
+            return empty_i32, empty_i32, empty_u8, empty_idx
+        out_x = torch.cat(xs_parts)
+        out_y = torch.cat(ys_parts)
+        out_c = torch.cat(cs_parts)
+        out_s = torch.cat(slots_parts)
+        self.pos_x[out_s] = out_x
+        self.pos_y[out_s] = out_y
+        return out_x, out_y, out_c, out_s
+
     def _step_free_agents(
         self, u_ids: torch.Tensor, canvas: CanvasState
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -382,24 +589,21 @@ class StochasticPolicy:
         dev = self.device
         W, H = canvas.active_w, canvas.active_h
 
-        # 12% jump toward trending activity hotspots or flush corners inside active viewport
-        jump_mask = torch.rand(n, device=dev) < 0.12
+        c = self.free_agent_clustering
         x = self.pos_x[u_ids].clamp(0, W - 1).clone()
         y = self.pos_y[u_ids].clamp(0, H - 1).clone()
 
-        n_jump = int(jump_mask.sum().item())
-        if n_jump > 0:
-            act_view = canvas.activity[:H, :W]
-            pool_w = max(1, W // 16)
-            coarse = F.avg_pool2d(
-                act_view.unsqueeze(0).unsqueeze(0), kernel_size=16, stride=16
-            ).flatten()
-            probs = coarse + 0.08
-            cell_idx = torch.multinomial(probs, n_jump, replacement=True)
-            cy = ((cell_idx // pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)).clamp(0, H - 1)
-            cx = ((cell_idx % pool_w) * 16 + torch.randint(0, 16, (n_jump,), device=dev)).clamp(0, W - 1)
-            x[jump_mask] = cx.to(torch.int32)
-            y[jump_mask] = cy.to(torch.int32)
+        # Chaotic players love claiming blank white spots (while still gravitating toward active art edges!)
+        on_white = canvas.colors[y, x] == WHITE_IDX
+        r_jump = torch.rand(n, device=dev)
+        jump_mask = ((~on_white) & (r_jump < 0.22)) | (on_white & (r_jump < 0.25))
+        jx, jy = self._sample_focal_positions(n, canvas)
+        # Half of jumpers probe a random canvas spot to claim remaining blank white pockets
+        rx = torch.randint(0, W, (n,), dtype=torch.int32, device=dev)
+        ry = torch.randint(0, H, (n,), dtype=torch.int32, device=dev)
+        use_white = jump_mask & (r_jump < 0.11) & (canvas.colors[ry, rx] == WHITE_IDX)
+        x = torch.where(use_white, rx, torch.where(jump_mask, jx, x))
+        y = torch.where(use_white, ry, torch.where(jump_mask, jy, y))
 
         dx = torch.randint(-2, 3, (n,), dtype=torch.int32, device=dev)
         dy = torch.randint(-2, 3, (n,), dtype=torch.int32, device=dev)
@@ -434,12 +638,14 @@ class StochasticPolicy:
         traits = self.trait[u_ids]
         colors = pref.clone()
 
-        m0 = (traits == 0) & has_nw & (torch.rand(n, device=dev) < 0.86)
+        p_conform = 0.28 + 0.66 * c
+        m0 = (traits == 0) & has_nw & (torch.rand(n, device=dev) < p_conform)
         colors = torch.where(m0, nbr_col, colors)
 
         horiz_nw = (c_l != WHITE_IDX) | (c_r != WHITE_IDX)
         horiz_col = torch.where(c_l != WHITE_IDX, c_l, c_r)
-        m1 = (traits == 1) & horiz_nw & (torch.rand(n, device=dev) < 0.78)
+        p_stripe = 0.25 + 0.60 * c
+        m1 = (traits == 1) & horiz_nw & (torch.rand(n, device=dev) < p_stripe)
         colors = torch.where(m1, horiz_col, colors)
         x = torch.where(traits == 1, (x + torch.randint(-2, 3, (n,), dtype=torch.int32, device=dev)).clamp(0, W - 1), x)
 
@@ -448,7 +654,8 @@ class StochasticPolicy:
         alt_col = torch.where(has_nw, nbr_col, torch.tensor(BLACK_IDX, dtype=torch.uint8, device=dev))
         colors = torch.where(m2 & (~parity), alt_col, colors)
 
-        m3 = (traits == 3) & (torch.rand(n, device=dev) < 0.30)
+        p_doodle = max(0.06, 0.38 - 0.28 * c)
+        m3 = (traits == 3) & has_nw & (torch.rand(n, device=dev) < p_doodle)
         rand_col = self._random_allowed_colors(n, canvas)
         colors = torch.where(m3, rand_col, colors)
 
@@ -459,6 +666,10 @@ class StochasticPolicy:
         colors = torch.where(m4_red, torch.tensor(DARK_RED_IDX, dtype=torch.uint8, device=dev), colors)
         m4_seed = (traits == 4) & (~touches_black) & (torch.rand(n, device=dev) < 0.25)
         colors = torch.where(m4_seed, torch.tensor(BLACK_IDX, dtype=torch.uint8, device=dev), colors)
+
+        # Never paint pure white onto a blank white pixel when claiming whitespace (pure GPU op, zero MPS sync!)
+        still_white = (colors == WHITE_IDX) & (canvas.colors[y, x] == WHITE_IDX)
+        colors = torch.where(still_white, torch.clamp(pref, min=1, max=NUM_COLORS - 1), colors)
 
         self.pos_x[u_ids] = x
         self.pos_y[u_ids] = y
@@ -599,18 +810,38 @@ class StochasticPolicy:
         dev = self.device
         W, H = canvas.active_w, canvas.active_h
 
-        # 1. Active Raid on a rival neighbor
+        # 1. Active Raid on a rival neighbor: push a coherent solid front strictly along opaque pixels on the shared side
         if fac.raid_target_id is not None and fac.raid_target_id in fac_by_id:
             target = fac_by_id[fac.raid_target_id]
-            rx = torch.randint(target.x0, max(target.x0 + 1, target.x1), (k,), dtype=torch.int32, device=dev)
-            ry = torch.randint(target.y0, max(target.y0 + 1, target.y1), (k,), dtype=torch.int32, device=dev)
-            pull = torch.rand(k, device=dev) < 0.60
-            cx_i = int(max(target.x0, min(target.x1 - 1, round(fac.cx))))
-            cy_i = int(max(target.y0, min(target.y1 - 1, round(fac.cy))))
-            rx = torch.where(pull, ((rx + cx_i) // 2).clamp(0, W - 1), rx)
-            ry = torch.where(pull, ((ry + cy_i) // 2).clamp(0, H - 1), ry)
+            dx_c = target.cx - fac.cx
+            dy_c = target.cy - fac.cy
+            # Concentrate attack along the ~35% edge strip facing the attacker so borders push cleanly instead of bbox confetti
+            if abs(dx_c) >= abs(dy_c):
+                band_w = max(4, int(round(target.w * 0.38)))
+                bx0 = target.x0 if dx_c >= 0 else max(target.x0, target.x1 - band_w)
+                bx1 = min(target.x1, target.x0 + band_w) if dx_c >= 0 else target.x1
+                by0, by1 = target.y0, target.y1
+            else:
+                band_h = max(4, int(round(target.h * 0.38)))
+                by0 = target.y0 if dy_c >= 0 else max(target.y0, target.y1 - band_h)
+                by1 = min(target.y1, target.y0 + band_h) if dy_c >= 0 else target.y1
+                bx0, bx1 = target.x0, target.x1
+
+            # Oversample 2x then filter strictly to opaque target pixels (blueprint >= 0) — zero empty-space confetti!
+            n_try = max(k * 2, 4)
+            rx = torch.randint(bx0, max(bx0 + 1, bx1), (n_try,), dtype=torch.int32, device=dev).clamp(0, W - 1)
+            ry = torch.randint(by0, max(by0 + 1, by1), (n_try,), dtype=torch.int32, device=dev).clamp(0, H - 1)
+            ly = (ry - target.y0).clamp(0, max(0, target.h - 1))
+            lx = (rx - target.x0).clamp(0, max(0, target.w - 1))
+            on_target = target.blueprint[ly, lx] >= 0
+            rx = rx[on_target][:k]
+            ry = ry[on_target][:k]
+            m_hit = int(rx.numel())
+            if m_hit == 0:
+                empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+                return empty_i32, empty_i32, torch.empty(0, dtype=torch.uint8, device=dev)
             col_pick = torch.where(
-                torch.rand(k, device=dev) < 0.72,
+                torch.rand(m_hit, device=dev) < 0.88,
                 torch.tensor(fac.primary_color % NUM_COLORS, dtype=torch.uint8, device=dev),
                 torch.tensor(fac.secondary_color % NUM_COLORS, dtype=torch.uint8, device=dev),
             )
@@ -656,16 +887,21 @@ class StochasticPolicy:
             ry = torch.randint(max(0, fac.y0 - 2), min(H, fac.y1 + 2), (k,), dtype=torch.int32, device=dev)
             return rx, ry, torch.full((k,), WHITE_IDX, dtype=torch.uint8, device=dev)
 
-        # Keep micro-sprites, paintings, comic strips, and cartoon memes crisp inside their outline
-        if fac.size_tier == "micro" or fac.art_mode in ("painting", "comic_strip", "flux_comic", "cartoon_meme"):
-            rx = torch.randint(fac.x0, max(fac.x0 + 1, fac.x1), (k,), dtype=torch.int32, device=dev)
-            ry = torch.randint(fac.y0, max(fac.y0 + 1, fac.y1), (k,), dtype=torch.int32, device=dev)
-            bp_c = fac.blueprint[(ry - fac.y0).clamp(0, fac.h - 1), (rx - fac.x0).clamp(0, fac.w - 1)]
-            valid_m = bp_c >= 0
-            return rx[valid_m], ry[valid_m], bp_c[valid_m].to(torch.uint8)
+        # Keep micro-sprites, paintings, comic strips, cartoon memes, and targeted-chaos artworks crisp inside their outline
+        if (
+            self.targeted_chaos_only
+            or fac.size_tier == "micro"
+            or fac.art_mode in ("painting", "comic_strip", "flux_comic", "cartoon_meme", "niche_badge")
+        ):
+            if fac.art_mode != "ribbon":
+                rx = torch.randint(fac.x0, max(fac.x0 + 1, fac.x1), (k,), dtype=torch.int32, device=dev)
+                ry = torch.randint(fac.y0, max(fac.y0 + 1, fac.y1), (k,), dtype=torch.int32, device=dev)
+                bp_c = fac.blueprint[(ry - fac.y0).clamp(0, fac.h - 1), (rx - fac.x0).clamp(0, fac.w - 1)]
+                valid_m = bp_c >= 0
+                return rx[valid_m], ry[valid_m], bp_c[valid_m].to(torch.uint8)
 
-        # Transverse ribbons push directly past their advancing tips
-        if fac.art_mode == "ribbon" and fac.ribbon_axis in ("h", "v"):
+        # Transverse ribbons push directly past their advancing tips (never fall through to circular rings!)
+        if fac.art_mode == "ribbon":
             if fac.ribbon_axis == "h":
                 tip = torch.where(
                     torch.rand(k, device=dev) < 0.5,
@@ -675,7 +911,7 @@ class StochasticPolicy:
                 ry = torch.randint(fac.y0, max(fac.y0 + 1, fac.y1), (k,), dtype=torch.int32, device=dev)
                 col_idx = fac.blueprint[(ry - fac.y0).clamp(0, fac.h - 1), torch.zeros(k, dtype=torch.long, device=dev)].clamp(0, NUM_COLORS - 1).to(torch.uint8)
                 return tip, ry, col_idx
-            else:
+            if fac.ribbon_axis == "v":
                 tip = torch.where(
                     torch.rand(k, device=dev) < 0.5,
                     (torch.full((k,), fac.y1, dtype=torch.int32, device=dev) + torch.randint(0, 6, (k,), dtype=torch.int32, device=dev)),
@@ -684,6 +920,8 @@ class StochasticPolicy:
                 rx = torch.randint(fac.x0, max(fac.x0 + 1, fac.x1), (k,), dtype=torch.int32, device=dev)
                 col_idx = fac.blueprint[torch.zeros(k, dtype=torch.long, device=dev), (rx - fac.x0).clamp(0, fac.w - 1)].clamp(0, NUM_COLORS - 1).to(torch.uint8)
                 return rx, tip, col_idx
+            empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+            return empty_i32, empty_i32, torch.empty(0, dtype=torch.uint8, device=dev)
 
         # Run silhouette halo expansion using cached halo coords (zero per-tick MPS torch.nonzero stalls)
         if fac.art_mode in ("flux_art", "ai_code", "streamer_raid", "diffusion", "procedural", "banner", "fractal", "black_hole", "void_monster"):
@@ -873,19 +1111,44 @@ class StochasticPolicy:
             return
         dev = self.device
 
-        # Keep >= 14% of online slots as free agents (including all One-Shot tourists)
+        # Track target_organized_share against continuous session turnover (keeping one-shot tourists free)
         eligible_mask = (self.user_factions == -1) & (self.initial_clicks > 1)
         free_ids = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
-        min_free_eligible = int(self.num_users * 0.14)
+        current_org = int((self.user_factions >= 0).sum().item())
 
-        if free_ids.numel() > min_free_eligible:
-            recruit_budget = min(int((free_ids.numel() - min_free_eligible) * 0.16), max(480, self.num_users // 80))
+        # Keep remaining (1 - target_organized_share) slots free (one-shot slots already account for ~2% online)
+        min_free_frac = max(0.05, 1.0 - self.target_organized_share - 0.02)
+        min_free_eligible = int(self.num_users * min_free_frac)
+
+        # Compute per-faction capacity scaled smoothly so active factions can sustain target_organized_share
+        target_org_slots = int(self.num_users * self.target_organized_share)
+        n_alive = len(alive)
+        per_fac_share = int((target_org_slots * 1.45) / max(1, n_alive))
+        caps: list[int] = []
+        total_headroom = 0
+        for f in alive:
+            if f.is_void or f.is_streamer_raid:
+                cap = 3500
+            else:
+                base_cap = _TIER_MEMBER_CAP.get(f.size_tier, 360)
+                tier_mult = 0.55 if f.size_tier == "micro" else (1.15 if f.size_tier == "medium" else 2.0)
+                cap = max(base_cap, min(2600, int(per_fac_share * tier_mult)))
+            caps.append(cap)
+            total_headroom += max(0, cap - f.member_count)
+
+        desired_org = min(target_org_slots, current_org + total_headroom)
+        deficit = max(0, desired_org - current_org)
+
+        if free_ids.numel() > min_free_eligible and deficit > 0:
+            avail_free = int(free_ids.numel()) - min_free_eligible
+            # Smoothly recruit enough citizens each social step to hold target_organized_share against session churn
+            max_step_budget = max(640, int(self.num_users * 0.14))
+            recruit_budget = min(avail_free, max(int(deficit * 0.65), min(deficit, max_step_budget)))
             if recruit_budget > 0:
                 perm = torch.randperm(free_ids.numel(), device=dev)[:recruit_budget]
                 candidates = free_ids[perm]
                 w_vals = []
-                for f in alive:
-                    cap = 3500 if (f.is_void or f.is_streamer_raid) else _TIER_MEMBER_CAP.get(f.size_tier, 360)
+                for f, cap in zip(alive, caps):
                     headroom = max(0.03, 1.0 - (f.member_count / max(1.0, float(cap))))
                     area_w = math.sqrt(max(100.0, float(f.w * f.h))) / 40.0
                     awake = timezone_awake_factor(f.timezone_region, self.virtual_hour_utc) if self.enable_timezones else 1.0

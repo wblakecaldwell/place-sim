@@ -145,7 +145,7 @@ def render_timelapse(
             e = int(frame_cutoffs[f_idx + 1])
             if e > s:
                 chunk = events[s:e]
-                grid[chunk["y"], chunk["x"]] = chunk["color"]
+                grid[chunk["y"], chunk["x"]] = np.clip(chunk["color"], 0, len(PALETTE_RGB) - 1)
                 cur_tick = int(chunk["tick"][-1])
             else:
                 cur_tick = int(events[max(0, s - 1)]["tick"])
